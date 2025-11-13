@@ -1,0 +1,2 @@
+# Comprehensive-Study-on-CCA-and-CNN-Loc-Algorithms-with-Various-Auditory-Datasets
+This study presents a comparative analysis of Canonical Correlation Analysis (CCA) and Convolutional Neural Network–Localization (CNN-Loc) algorithms for auditory signal processing, evaluating their performance in decoding and classifying auditory stimuli across multiple datasets with diverse acoustic conditions and subjects.
