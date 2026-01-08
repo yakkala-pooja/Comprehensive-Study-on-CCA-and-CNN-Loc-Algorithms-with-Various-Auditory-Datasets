@@ -36,10 +36,6 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 
-# ============================================================================
-# FULCNN Architecture Components (extracted from FULCNN.py)
-# ============================================================================
-
 class SpatialTemporalAttention(nn.Module):
     """Channel attention for EEG data."""
     
