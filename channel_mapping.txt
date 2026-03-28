@@ -1,0 +1,168 @@
+EXACT CHANNEL NUMBER TO CHANNEL NAME MAPPING
+============================================
+
+NOTE: There is a discrepancy between the JSON "count" field and the actual array lengths.
+The mappings below reflect the ACTUAL channels in the arrays.
+
+DAS DATASET (68 channels, indices 0-67)
+----------------------------------------
+Channel  0 -> Fp1
+Channel  1 -> Fpz
+Channel  2 -> Fp2
+Channel  3 -> F7
+Channel  4 -> F3
+Channel  5 -> Fz
+Channel  6 -> F4
+Channel  7 -> F8
+Channel  8 -> FT7
+Channel  9 -> FC3
+Channel 10 -> FCz
+Channel 11 -> FC4
+Channel 12 -> FT8
+Channel 13 -> T7
+Channel 14 -> C3
+Channel 15 -> Cz
+Channel 16 -> C4
+Channel 17 -> T8
+Channel 18 -> TP7
+Channel 19 -> CP3
+Channel 20 -> CPz
+Channel 21 -> CP4
+Channel 22 -> TP8
+Channel 23 -> P7
+Channel 24 -> P3
+Channel 25 -> Pz
+Channel 26 -> P4
+Channel 27 -> P8
+Channel 28 -> PO7
+Channel 29 -> PO3
+Channel 30 -> POz
+Channel 31 -> PO4
+Channel 32 -> PO8
+Channel 33 -> O1
+Channel 34 -> Oz
+Channel 35 -> O2
+Channel 36 -> AF7
+Channel 37 -> AF3
+Channel 38 -> AFz
+Channel 39 -> AF4
+Channel 40 -> AF8
+Channel 41 -> F5
+Channel 42 -> F1
+Channel 43 -> F2
+Channel 44 -> F6
+Channel 45 -> FC5
+Channel 46 -> FC1
+Channel 47 -> FC2
+Channel 48 -> FC6
+Channel 49 -> C5
+Channel 50 -> C1
+Channel 51 -> C2
+Channel 52 -> C6
+Channel 53 -> CP5
+Channel 54 -> CP1
+Channel 55 -> CP2
+Channel 56 -> CP6
+Channel 57 -> P5
+Channel 58 -> P1
+Channel 59 -> P2
+Channel 60 -> P6
+Channel 61 -> PO5
+Channel 62 -> PO1
+Channel 63 -> PO2
+Channel 64 -> PO6
+Channel 65 -> I1
+Channel 66 -> Iz
+Channel 67 -> I2
+
+
+FULSANG DATASET (75 channels total, indices 0-74)
+--------------------------------------------------
+EEG Channels (0-67):
+Channel  0 -> Fp1
+Channel  1 -> Fpz
+Channel  2 -> Fp2
+Channel  3 -> F7
+Channel  4 -> F3
+Channel  5 -> Fz
+Channel  6 -> F4
+Channel  7 -> F8
+Channel  8 -> FT7
+Channel  9 -> FC3
+Channel 10 -> FCz
+Channel 11 -> FC4
+Channel 12 -> FT8
+Channel 13 -> T7
+Channel 14 -> C3
+Channel 15 -> Cz
+Channel 16 -> C4
+Channel 17 -> T8
+Channel 18 -> TP7
+Channel 19 -> CP3
+Channel 20 -> CPz
+Channel 21 -> CP4
+Channel 22 -> TP8
+Channel 23 -> P7
+Channel 24 -> P3
+Channel 25 -> Pz
+Channel 26 -> P4
+Channel 27 -> P8
+Channel 28 -> PO7
+Channel 29 -> PO3
+Channel 30 -> POz
+Channel 31 -> PO4
+Channel 32 -> PO8
+Channel 33 -> O1
+Channel 34 -> Oz
+Channel 35 -> O2
+Channel 36 -> AF7
+Channel 37 -> AF3
+Channel 38 -> AFz
+Channel 39 -> AF4
+Channel 40 -> AF8
+Channel 41 -> F5
+Channel 42 -> F1
+Channel 43 -> F2
+Channel 44 -> F6
+Channel 45 -> FC5
+Channel 46 -> FC1
+Channel 47 -> FC2
+Channel 48 -> FC6
+Channel 49 -> C5
+Channel 50 -> C1
+Channel 51 -> C2
+Channel 52 -> C6
+Channel 53 -> CP5
+Channel 54 -> CP1
+Channel 55 -> CP2
+Channel 56 -> CP6
+Channel 57 -> P5
+Channel 58 -> P1
+Channel 59 -> P2
+Channel 60 -> P6
+Channel 61 -> PO5
+Channel 62 -> PO1
+Channel 63 -> PO2
+Channel 64 -> PO6
+Channel 65 -> I1
+Channel 66 -> Iz
+Channel 67 -> I2
+
+EOG/Auxiliary Channels (68-74):
+Channel 68 -> EXG3
+Channel 69 -> EXG4
+Channel 70 -> EXG5
+Channel 71 -> EXG6
+Channel 72 -> EXG7
+Channel 73 -> EXG8
+Channel 74 -> Status
+
+
+SUMMARY:
+--------
+- DAS dataset: 68 channels (indices 0-67), all EEG
+- Fulsang dataset: 75 channels total (indices 0-74)
+  - Channels 0-67: EEG (68 channels)
+  - Channels 68-74: EOG/Auxiliary (7 channels)
+- The first 68 channels are identical between DAS and Fulsang datasets
+- All channel numbers are 0-indexed

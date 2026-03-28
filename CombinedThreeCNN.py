@@ -50,8 +50,8 @@ class FocalLoss(nn.Module):
 
 class CombinedThreeDataset(CombinedDataset):
     def __init__(self,
-                 das_data_dir: str = "das_16subjects_preprocessed",
-                 das_preprocessing_type: str = "16SUBJECTS",
+                 das_data_dir: str = "das_combined_preprocessed",
+                 das_preprocessing_type: str = "COMBINED_DAS",
                  das_original_dir: str = "Data/Das/4004271",
                  das_audio_dir: str = "Data/Das/4004271/stimuli/stimuli",
                  fulsang_raw_dir: str = "/home/py9363/telluride_decoding/Data/Fulsang/EEG",
@@ -850,10 +850,10 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Combined Three Datasets (Das+Fulsang+KU Leuven 255) CNN-LOC')
-    parser.add_argument('--das_data_dir', type=str, default='das_16subjects_preprocessed',
+    parser.add_argument('--das_data_dir', type=str, default='das_combined_preprocessed',
                        help='Directory containing Das preprocessed data')
-    parser.add_argument('--das_preprocessing_type', type=str, default='16SUBJECTS',
-                       choices=['MWF', 'DASPREPROCESS', '16SUBJECTS'],
+    parser.add_argument('--das_preprocessing_type', type=str, default='COMBINED_DAS',
+                       choices=['COMBINED_DAS', 'MWF', 'DASPREPROCESS'],
                        help='Type of Das preprocessing')
     parser.add_argument('--fulsang_raw_dir', type=str, default=None,
                        help='Directory containing Fulsang raw EEG data')

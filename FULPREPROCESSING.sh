@@ -71,39 +71,59 @@ if missing_packages:
 
 # Function to check Fulsang data availability
 check_fulsang_data() {
-    if [ -d "Data/Fulsang/DATA_preproc" ]; then
+    # Check for DATA_preproc directory (prefer absolute path, fallback to relative)
+    if [ -d "/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc" ]; then
+        mat_count=$(find /home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc -name "S*_data_preproc.mat" 2>/dev/null | wc -l)
+        if [ $mat_count -eq 0 ]; then
+            echo "ERROR: No MATLAB files found in /home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc"
+            return 1
+        fi
+        echo "Found $mat_count MATLAB files in DATA_preproc"
+        return 0
+    elif [ -d "Data/Fulsang/DATA_preproc" ]; then
         mat_count=$(find Data/Fulsang/DATA_preproc -name "S*_data_preproc.mat" 2>/dev/null | wc -l)
         if [ $mat_count -eq 0 ]; then
             echo "ERROR: No MATLAB files found in Data/Fulsang/DATA_preproc"
             return 1
         fi
+        echo "Found $mat_count MATLAB files in DATA_preproc"
         return 0
     else
-        echo "ERROR: Fulsang data directory not found at Data/Fulsang/DATA_preproc"
+        echo "ERROR: Fulsang data directory not found"
+        echo "Expected locations:"
+        echo "  /home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc"
+        echo "  Data/Fulsang/DATA_preproc"
         return 1
     fi
 }
 
 # Function to run FULPREPROCESSING
 run_fulpreprocessing() {
-    if [ ! -f "FULPREPROCESSING.py" ]; then
-        echo "ERROR: FULPREPROCESSING.py not found"
+    if [ ! -f "FULPREPROCESSING_PYTHON.py" ]; then
+        echo "ERROR: FULPREPROCESSING_PYTHON.py not found"
         return 1
     fi
     
-    if [ ! -d "Data/Fulsang/DATA_preproc" ]; then
+    # Determine DATA_preproc path
+    if [ -d "/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc" ]; then
+        DATA_PREPROC_PATH="/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc"
+    elif [ -d "Data/Fulsang/DATA_preproc" ]; then
+        DATA_PREPROC_PATH="Data/Fulsang/DATA_preproc"
+    else
         echo "ERROR: Fulsang data directory not found"
         return 1
     fi
     
-    python3 FULPREPROCESSING.py \
-        --data_dir Data/Fulsang \
-        --output_dir fulsang_preprocessed > fulpreprocessing.log 2>&1
+    echo "Using DATA_preproc path: $DATA_PREPROC_PATH"
+    
+    python3 FULPREPROCESSING_PYTHON.py \
+        --data_preproc_path "$DATA_PREPROC_PATH" \
+        --output_dir "Preprocessed_FulsangNorm" > fulpreprocessing.log 2>&1
     
     local exit_code=$?
     
     if [ $exit_code -ne 0 ]; then
-        echo "ERROR: FULPREPROCESSING failed with exit code: $exit_code"
+        echo "ERROR: FULPREPROCESSING_PYTHON failed with exit code: $exit_code"
         echo "Check the error log: fulpreprocessing.log"
         tail -20 fulpreprocessing.log
         return $exit_code
@@ -114,27 +134,31 @@ run_fulpreprocessing() {
 
 # Function to validate preprocessing results
 validate_preprocessing_results() {
-    if [ ! -d "fulsang_preprocessed/tfrecords" ]; then
+    if [ ! -d "Preprocessed_FulsangNorm/tfrecords" ]; then
         echo "ERROR: TFRecord directory not found"
         return 1
     fi
     
-    tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
+    tfrecord_count=$(find Preprocessed_FulsangNorm/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
     if [ $tfrecord_count -eq 0 ]; then
         echo "ERROR: No TFRecord files found"
         return 1
     fi
     
+    echo "Validating $tfrecord_count TFRecord files..."
+    
     python3 -c "
 import tensorflow as tf
 from pathlib import Path
 
-tfrecord_dir = Path('fulsang_preprocessed/tfrecords')
+tfrecord_dir = Path('Preprocessed_FulsangNorm/tfrecords')
 tfrecord_files = list(tfrecord_dir.glob('*.tfrecords'))
 
 if not tfrecord_files:
     print('ERROR: No TFRecord files found for validation')
     exit(1)
+
+print(f'Validating {len(tfrecord_files)} TFRecord files...')
 
 for i, tfrecord_file in enumerate(tfrecord_files[:3]):
     try:
@@ -145,21 +169,17 @@ for i, tfrecord_file in enumerate(tfrecord_files[:3]):
             example = tf.train.Example.FromString(record.numpy())
             features = example.features.feature
             
-            required_features = ['eeg', 'envelope', 'attention_label', 'subject_id']
+            # FULPREPROCESSING_PYTHON creates: eeg, attention_label, subject_id, sample_idx, file_source
+            required_features = ['eeg', 'attention_label', 'subject_id']
             if not all(key in features for key in required_features):
                 print(f'ERROR: Missing required features in {tfrecord_file.name}')
                 exit(1)
             
             eeg_values = features['eeg'].float_list.value
-            envelope_values = features['envelope'].float_list.value
             attention_label = features['attention_label'].int64_list.value[0]
             
             if len(eeg_values) != 66:
                 print(f'ERROR: EEG data has {len(eeg_values)} channels, expected 66')
-                exit(1)
-            
-            if len(envelope_values) != 1:
-                print(f'ERROR: Envelope data has {len(envelope_values)} values, expected 1')
                 exit(1)
             
             if attention_label not in [0, 1]:
@@ -170,9 +190,13 @@ for i, tfrecord_file in enumerate(tfrecord_files[:3]):
             if record_count >= 10:
                 break
         
+        print(f'  {tfrecord_file.name}: {record_count} records validated')
+        
     except Exception as e:
         print(f'ERROR: Error validating {tfrecord_file.name}: {e}')
         exit(1)
+
+print('Validation passed!')
 "
     
     return $?
@@ -180,9 +204,11 @@ for i, tfrecord_file in enumerate(tfrecord_files[:3]):
 
 # Function to create final summary report
 create_final_summary() {
-    if [ -d "fulsang_preprocessed/tfrecords" ]; then
-        tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
-        echo "Created $tfrecord_count TFRecord files"
+    if [ -d "Preprocessed_FulsangNorm/tfrecords" ]; then
+        tfrecord_count=$(find Preprocessed_FulsangNorm/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
+        echo "Created $tfrecord_count TFRecord files in Preprocessed_FulsangNorm/tfrecords"
+    else
+        echo "WARNING: TFRecord directory not found"
     fi
 }
 

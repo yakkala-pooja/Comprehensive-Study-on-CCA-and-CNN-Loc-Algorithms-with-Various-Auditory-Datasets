@@ -8,6 +8,7 @@ Includes metrics (accuracy, MSED, ROC-AUC) and temporal analysis.
 
 import os
 import sys
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -55,7 +56,7 @@ class FulsangDataset(Dataset):
     """
     
     def __init__(self, tfrecord_dir: str, mode: str = 'full', 
-                 window_size: int = 32, overlap: float = 0.5,
+                 window_size: int = 512, overlap: float = 0.5,
                  transform_eeg: bool = True, cache_size: int = 1000):
         self.tfrecord_dir = Path(tfrecord_dir)
         self.mode = mode
@@ -77,9 +78,18 @@ class FulsangDataset(Dataset):
         # Load data from FULPREPROCESSING output
         self.eeg_data, self.labels, self.metadata = self._load_fulpreprocessing_data()
         
+        # CRITICAL FIX: Fix labels BEFORE windowing/preprocessing to preserve temporal alignment
+        # This ensures labels are correct before we destroy temporal semantics with preprocessing
+        self.labels = self._fix_labels_before_processing()
+        
         self.window_indices = self._create_fulsang_windows()
         
-        print(f"Loaded {len(self.window_indices)} windows, EEG shape: {self.eeg_data.shape}, Label dist: {np.bincount(self.labels)}")
+        # Check window label distribution
+        window_labels = [label for _, label in self.window_indices]
+        window_label_dist = np.bincount(window_labels)
+        print(f"Loaded {len(self.window_indices)} windows, EEG shape: {self.eeg_data.shape}")
+        print(f"Raw label dist: {np.bincount(self.labels)}")
+        print(f"Window label dist: {dict(enumerate(window_label_dist))}")
     
     def _load_fulpreprocessing_data(self) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
         """Load TFRecord data from FULPREPROCESSING output. Validates shapes."""
@@ -217,8 +227,83 @@ class FulsangDataset(Dataset):
         # Final shape validation
         print(f"Final data shapes: EEG {eeg_data.shape}, Labels {labels.shape}")
         
-        if eeg_data.shape[1] != 66:
-            raise ValueError(f"CRITICAL: EEG data has {eeg_data.shape[1]} channels, expected 66")
+        # Check raw label distribution BEFORE windowing
+        raw_label_dist = np.bincount(labels)
+        print(f"\nRaw label distribution (before windowing): {dict(enumerate(raw_label_dist))}")
+        if len(raw_label_dist) < 2:
+            print(f"⚠️  CRITICAL: Raw data has only {len(raw_label_dist)} class(es)!")
+            print(f"   This means the TFRecords have incorrect labels or all subjects have the same class.")
+        elif raw_label_dist[0] == 0 or raw_label_dist[1] == 0:
+            print(f"⚠️  CRITICAL: Raw data is missing one class!")
+        else:
+            balance_ratio = min(raw_label_dist) / max(raw_label_dist)
+            print(f"Raw data class distribution (ratio: {balance_ratio:.3f})")
+            if balance_ratio < 0.5:
+                print(f"  Note: Dataset is unbalanced (expected for Fulsang dataset)")
+        
+        # Check label structure - are labels grouped or alternating?
+        # Check first 100 and last 100 samples to see pattern
+        first_100_labels = labels[:100]
+        last_100_labels = labels[-100:]
+        first_100_dist = np.bincount(first_100_labels)
+        last_100_dist = np.bincount(last_100_labels)
+        print(f"Label structure check:")
+        print(f"  First 100 samples: {dict(enumerate(first_100_dist))}")
+        print(f"  Last 100 samples: {dict(enumerate(last_100_dist))}")
+        
+        # Check label transitions
+        label_changes = np.sum(np.diff(labels) != 0)
+        expected_transitions = len(labels) // 1280  # Every 20 seconds = 1280 samples
+        print(f"  Total label transitions in data: {label_changes}")
+        print(f"  Expected transitions (if alternating every 20s): ~{expected_transitions}")
+        
+        # CRITICAL: Check if labels are alternating too frequently (data issue)
+        if label_changes > expected_transitions * 10:
+            print(f"\n⚠️  CRITICAL DATA ISSUE DETECTED:")
+            print(f"   Labels are alternating {label_changes} times, but should only alternate ~{expected_transitions} times.")
+            print(f"   This suggests labels in TFRecords are alternating EVERY SAMPLE instead of every 20 seconds.")
+            print(f"   This will cause ALL windows to get the same class (due to center-label assignment bias).")
+            print(f"   SOLUTION: Regenerate TFRecords with correct labels (alternating every 1280 samples, not every sample).")
+            print(f"   WORKAROUND: Using majority vote for window labels when labels alternate too frequently.")
+        
+        # Check per-subject label structure
+        print(f"\nPer-subject label structure (first subject):")
+        if len(all_metadata) > 0 and len(labels) >= 3200:
+            subject_labels = labels[:3200]
+            subject_dist = np.bincount(subject_labels)
+            first_half = np.bincount(subject_labels[:1600])
+            second_half = np.bincount(subject_labels[1600:])
+            print(f"  Subject {all_metadata[0].get('subject_id', 'unknown')}:")
+            print(f"    Full (3200 samples): {dict(enumerate(subject_dist))}")
+            print(f"    First half (0-1600): {dict(enumerate(first_half))}")
+            print(f"    Second half (1600-3200): {dict(enumerate(second_half))}")
+            
+            # Check trial structure (if 1280 samples per trial)
+            if len(subject_labels) >= 2560:
+                trial1 = np.bincount(subject_labels[0:1280])
+                trial2 = np.bincount(subject_labels[1280:2560])
+                print(f"    Trial 1 (0-1280): {dict(enumerate(trial1))}")
+                print(f"    Trial 2 (1280-2560): {dict(enumerate(trial2))}")
+            
+            # Check where label transitions occur
+            transitions = np.where(np.diff(subject_labels) != 0)[0]
+            print(f"    Label transitions at indices: {transitions[:10]} (showing first 10)")
+        
+        print(f"\n⚠️  PREPROCESSING INFO:")
+        print(f"  FULPREPROCESSING creates labels as alternating trials:")
+        print(f"    - Each trial = 20 seconds (1280 samples at 64 Hz)")
+        print(f"    - Trial 0 = class 0, Trial 1 = class 1, Trial 2 = class 0, etc.")
+        print(f"    - With 512-sample windows (8s) and 50% overlap, many windows")
+        print(f"      fall entirely within the first trial (class 0)")
+        print(f"    - Center label assignment should help, but if all centers")
+        print(f"      fall in class 0 regions, all windows get class 0")
+        
+        # Check channel count dynamically (don't hardcode 66)
+        actual_channels = eeg_data.shape[1]
+        print(f"Detected {actual_channels} EEG channels in data")
+        if actual_channels != self.n_channels:
+            print(f"WARNING: Dataset has {actual_channels} channels but expected {self.n_channels}. Updating n_channels.")
+            self.n_channels = actual_channels
         
         if len(eeg_data) != len(labels):
             raise ValueError(f"CRITICAL: EEG samples ({len(eeg_data)}) != labels ({len(labels)})")
@@ -229,16 +314,81 @@ class FulsangDataset(Dataset):
         
         return eeg_data, labels, all_metadata
     
+    def _fix_labels_before_processing(self) -> np.ndarray:
+        """
+        CRITICAL: Fix labels BEFORE preprocessing to preserve temporal alignment.
+        This ensures labels are correct before we destroy temporal semantics.
+        """
+        trial_length = 1280  # 20 seconds at 64 Hz
+        n_samples = len(self.labels)
+        n_trials = n_samples // trial_length
+        
+        # Check if labels need fixing
+        label_changes = np.sum(np.diff(self.labels) != 0)
+        expected_transitions = n_trials - 1 if n_trials > 1 else 0
+        labels_alternating_too_fast = label_changes > expected_transitions * 10 if expected_transitions > 0 else label_changes > 100
+        labels_alternating_too_slow = label_changes < expected_transitions * 0.1 if expected_transitions > 0 else False
+        
+        if not (labels_alternating_too_fast or labels_alternating_too_slow):
+            # Labels look correct, return as-is
+            return self.labels
+        
+        print(f"\n🔧 FIXING LABELS BEFORE PREPROCESSING (preserving temporal alignment)")
+        print(f"   Original transitions: {label_changes}, Expected: ~{expected_transitions}")
+        
+        if n_trials < 1:
+            print(f"   WARNING: Cannot fix - need at least 1 complete trial")
+            return self.labels
+        
+        # Reconstruct labels based on trial structure
+        fixed_labels = np.zeros(n_samples, dtype=np.int64)
+        for trial_idx in range(n_trials):
+            trial_start = trial_idx * trial_length
+            trial_end = min(trial_start + trial_length, n_samples)
+            trial_class = trial_idx % 2  # Alternating: 0, 1, 0, 1, ...
+            fixed_labels[trial_start:trial_end] = trial_class
+        
+        # Handle remaining samples
+        if n_samples % trial_length > 0:
+            remaining_start = n_trials * trial_length
+            remaining_class = n_trials % 2
+            fixed_labels[remaining_start:] = remaining_class
+        
+        fixed_transitions = np.sum(np.diff(fixed_labels) != 0)
+        print(f"   ✓ Fixed labels: {fixed_transitions} transitions (expected ~{expected_transitions})")
+        
+        return fixed_labels
+    
     def _create_fulsang_windows(self) -> List[Tuple[int, int]]:
-        """Create sliding windows from Fulsang data."""
+        """Create sliding windows from Fulsang data, respecting subject boundaries."""
         # Convert to seconds for display
         window_seconds = self.window_size / self.sampling_rate
         step_size = int(self.window_size * (1 - self.overlap))
         step_seconds = step_size / self.sampling_rate
         
+        # Build subject boundaries from metadata to prevent cross-subject windows
+        subject_ranges = {}
+        current_subject = None
+        start_idx = 0
+        
+        for i, metadata in enumerate(self.metadata):
+            subject_id = metadata.get('subject_id', 'unknown')
+            
+            if subject_id != current_subject:
+                if current_subject is not None:
+                    subject_ranges[current_subject] = (start_idx, i)
+                current_subject = subject_id
+                start_idx = i
+        
+        # Last subject
+        if current_subject is not None:
+            subject_ranges[current_subject] = (start_idx, len(self.metadata))
+        
+        print(f"Detected {len(subject_ranges)} subjects for boundary checking")
+        
         total_windows = (len(self.eeg_data) - self.window_size) // step_size + 1
         
-        print(f"Creating {total_windows} windows (size: {self.window_size} samples, {window_seconds:.1f}s)")
+        print(f"Creating windows (size: {self.window_size} samples, {window_seconds:.1f}s)")
         
         # Warn about window size
         if window_seconds < 1.0:
@@ -246,26 +396,191 @@ class FulsangDataset(Dataset):
         elif window_seconds > 20.0:
             print(f"WARNING: Very long window ({window_seconds:.1f}s) may miss temporal dynamics")
         
+        # Labels are already fixed before preprocessing, so we can trust them
+        # Now use temporal-aware labeling instead of majority vote
+        
         window_indices = []
+        window_label_stats = {'class_0': 0, 'class_1': 0, 'mixed': 0}
+        skipped_cross_boundary = 0
+        
         for i in range(total_windows):
             data_idx = i * step_size
-            if data_idx + self.window_size <= len(self.eeg_data):
-                # Use majority voting for label (handles trial transitions)
-                window_start = data_idx
-                window_end = data_idx + self.window_size
-                window_labels = self.labels[window_start:window_end]
-                
-                # Majority vote
-                if len(window_labels) > 0:
-                    window_label = int(np.bincount(window_labels).argmax())
+            window_end = data_idx + self.window_size
+            
+            # Check if window would exceed data length
+            if window_end > len(self.eeg_data):
+                continue
+            
+            # Check if window spans subject boundary
+            window_spans_boundary = False
+            window_subject = None
+            
+            # Find which subject this window belongs to
+            for subj_id, (subj_start, subj_end) in subject_ranges.items():
+                if subj_start <= data_idx < subj_end:
+                    window_subject = subj_id
+                    # Check if window extends beyond this subject's boundary
+                    if window_end > subj_end:
+                        window_spans_boundary = True
+                    break
+            
+            # Skip windows that span subject boundaries (prevents data leakage)
+            if window_spans_boundary:
+                skipped_cross_boundary += 1
+                continue
+            
+            # Window is valid - create it
+            window_start = data_idx
+            window_labels = self.labels[window_start:window_end]
+            
+            # TEMPORAL-AWARE LABELING: Weight by position in trial, not majority vote
+            # Attention ramps gradually, so windows near trial boundaries need weighted labels
+            # This preserves the gradual transition information that majority vote destroys
+            trial_length = 1280  # 20 seconds
+            window_center_in_trial = (data_idx + self.window_size // 2) % trial_length
+            window_relative_pos = window_center_in_trial / trial_length  # 0.0 to 1.0
+            
+            # Determine which trial this window is in
+            trial_idx = (data_idx + self.window_size // 2) // trial_length
+            trial_class = trial_idx % 2  # Alternating: 0, 1, 0, 1, ...
+            
+            # For windows near trial boundaries, use weighted label based on position
+            # Windows in middle of trial get pure trial label
+            # Windows near boundaries get weighted average
+            boundary_threshold = 0.15  # 15% of trial = ~3 seconds
+            
+            if window_relative_pos < boundary_threshold:
+                # Near start of trial - weight towards previous trial
+                prev_trial_class = (trial_idx - 1) % 2 if trial_idx > 0 else trial_class
+                weight_current = window_relative_pos / boundary_threshold
+                weighted_label = weight_current * trial_class + (1 - weight_current) * prev_trial_class
+                window_label = int(round(weighted_label))
+            elif window_relative_pos > (1 - boundary_threshold):
+                # Near end of trial - weight towards next trial
+                next_trial_class = (trial_idx + 1) % 2
+                weight_current = (1 - window_relative_pos) / boundary_threshold
+                weighted_label = weight_current * trial_class + (1 - weight_current) * next_trial_class
+                window_label = int(round(weighted_label))
+            else:
+                # Middle of trial - use pure trial label
+                window_label = trial_class
+            
+            # Clamp to valid range
+            window_label = max(0, min(1, window_label))
+            
+            # Track label distribution for diagnostics
+            unique_labels = np.unique(window_labels)
+            if len(unique_labels) == 1:
+                if unique_labels[0] == 0:
+                    window_label_stats['class_0'] += 1
                 else:
-                    window_label = 0
-                
-                window_indices.append((data_idx, window_label))
+                    window_label_stats['class_1'] += 1
+            else:
+                window_label_stats['mixed'] += 1
+            
+            window_indices.append((data_idx, window_label))
+        
+        if skipped_cross_boundary > 0:
+            print(f"Skipped {skipped_cross_boundary} windows that would span subject boundaries (prevents data leakage)")
         
         print(f"Created {len(window_indices)} windows")
+        print(f"Window label assignment stats:")
+        print(f"  Windows with only class 0: {window_label_stats['class_0']}")
+        print(f"  Windows with only class 1: {window_label_stats['class_1']}")
+        print(f"  Windows with mixed labels: {window_label_stats['mixed']}")
+        
+        # Check final window label distribution
+        final_window_labels = [label for _, label in window_indices]
+        final_label_dist = np.bincount(final_window_labels)
+        print(f"Final window label distribution: {dict(enumerate(final_label_dist))}")
+        
+        # CRITICAL: Check if window labels are severely imbalanced
+        if len(final_label_dist) < 2:
+            print(f"\n⚠️  CRITICAL: All windows have the same label! This will cause the model to fail.")
+            print(f"   Window label distribution: {dict(enumerate(final_label_dist))}")
+            print(f"   This suggests the raw labels are incorrect or the label fixing didn't work.")
+        elif len(final_label_dist) == 2:
+            balance_ratio = min(final_label_dist) / max(final_label_dist)
+            print(f"Window label balance ratio: {balance_ratio:.3f} (1.0 = perfectly balanced)")
+            if balance_ratio < 0.1:
+                print(f"⚠️  WARNING: Severely imbalanced window labels (ratio: {balance_ratio:.3f})")
+                print(f"   This will make learning very difficult. Consider checking the raw labels.")
+            elif balance_ratio < 0.3:
+                print(f"⚠️  WARNING: Imbalanced window labels (ratio: {balance_ratio:.3f})")
+                print(f"   The model will use class weights, but results may be suboptimal.")
         
         return window_indices
+    
+    def _fix_alternating_labels(self) -> Optional[np.ndarray]:
+        """
+        Attempt to fix labels that are alternating every sample.
+        Reconstructs labels based on trial structure (20s = 1280 samples per trial).
+        Uses alternating pattern: Trial 0 = class 0, Trial 1 = class 1, etc.
+        """
+        try:
+            trial_length = 1280  # 20 seconds at 64 Hz
+            n_samples = len(self.labels)
+            n_trials = n_samples // trial_length
+            
+            print(f"   Attempting label fix: {n_samples} samples, {n_trials} complete trials of {trial_length} samples each")
+            
+            if n_trials < 1:
+                print(f"   Cannot fix: Need at least 1 complete trial ({trial_length} samples), but only have {n_samples} samples")
+                return None
+            
+            # Check original label distribution
+            original_dist = np.bincount(self.labels)
+            print(f"   Original label distribution: {dict(enumerate(original_dist))}")
+            
+            fixed_labels = np.zeros(n_samples, dtype=np.int64)
+            
+            # Reconstruct labels based on alternating trial pattern
+            # Trial 0 = class 0, Trial 1 = class 1, Trial 2 = class 0, etc.
+            for trial_idx in range(n_trials):
+                trial_start = trial_idx * trial_length
+                trial_end = min(trial_start + trial_length, n_samples)
+                
+                # Assign alternating class based on trial index
+                # Even trials (0, 2, 4, ...) = class 0
+                # Odd trials (1, 3, 5, ...) = class 1
+                trial_class = trial_idx % 2
+                fixed_labels[trial_start:trial_end] = trial_class
+                print(f"   Trial {trial_idx}: samples {trial_start}-{trial_end} -> class {trial_class}")
+            
+            # Handle remaining samples (use the pattern from the last complete trial)
+            if n_samples % trial_length > 0:
+                remaining_start = n_trials * trial_length
+                remaining_class = n_trials % 2  # Continue the alternating pattern
+                fixed_labels[remaining_start:] = remaining_class
+                print(f"   Remaining {n_samples - remaining_start} samples -> class {remaining_class}")
+            
+            # Verify the fix makes sense
+            fixed_transitions = np.sum(np.diff(fixed_labels) != 0)
+            expected_transitions = n_trials - 1  # One transition per trial boundary (if n_trials > 1)
+            
+            # Check label distribution
+            fixed_dist = np.bincount(fixed_labels)
+            print(f"   Fixed label distribution: {dict(enumerate(fixed_dist))}")
+            print(f"   Fixed transitions: {fixed_transitions} (expected ~{expected_transitions})")
+            
+            # Check balance
+            if len(fixed_dist) == 2:
+                balance_ratio = min(fixed_dist) / max(fixed_dist)
+                print(f"   Fixed label balance ratio: {balance_ratio:.3f}")
+            
+            # Validation: check transitions (class balance is not required - dataset is naturally unbalanced)
+            if len(fixed_dist) >= 1 and fixed_transitions <= expected_transitions * 2:
+                print(f"   ✓ Label fix validation passed")
+                return fixed_labels
+            else:
+                print(f"   ✗ Fix validation failed: transitions={fixed_transitions} (expected ~{expected_transitions})")
+                return None
+                
+        except Exception as e:
+            print(f"   Error fixing labels: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def _fulsang_eeg_preprocessing(self, eeg_window: np.ndarray) -> np.ndarray:
         """Preprocess EEG window: artifacts, filtering, normalization."""
@@ -296,25 +611,29 @@ class FulsangDataset(Dataset):
         # Remove DC offset
         eeg_window = eeg_window - np.mean(eeg_window, axis=0, keepdims=True)
         
-        # Bandpass filter (1-40 Hz)
+        # GENTLER BANDPASS FILTER: Preserve low-frequency attention envelopes
+        # Use wider passband (0.5-40 Hz) to preserve delta/theta attention signals
         nyquist = self.sampling_rate / 2
-        low_freq = 1.0 / nyquist
-        high_freq = min(40.0 / nyquist, 0.99)  # Keep below Nyquist
+        low_freq = 0.5 / nyquist  # Lower cutoff to preserve delta/theta
+        high_freq = min(40.0 / nyquist, 0.99)
         
-        b, a = signal.butter(4, [low_freq, high_freq], btype='band')
+        b, a = signal.butter(2, [low_freq, high_freq], btype='band')  # Lower order = less distortion
         
         # Apply filter to each channel
         filtered_eeg = np.zeros_like(eeg_window)
         for ch in range(eeg_window.shape[1]):
             filtered_eeg[:, ch] = signal.filtfilt(b, a, eeg_window[:, ch])
         
-        # Normalize using MAD
-        mad = np.median(np.abs(filtered_eeg - np.median(filtered_eeg, axis=0)), axis=0)
-        mad = np.where(mad == 0, 1.0, mad)  # Avoid div by zero
-        filtered_eeg = filtered_eeg / mad
+        # GENTLER NORMALIZATION: Preserve relative amplitudes across time
+        # Use per-channel z-score instead of MAD to preserve temporal structure
+        mean_per_ch = np.mean(filtered_eeg, axis=0, keepdims=True)
+        std_per_ch = np.std(filtered_eeg, axis=0, keepdims=True)
+        std_per_ch = np.where(std_per_ch < 1e-8, 1.0, std_per_ch)
+        filtered_eeg = (filtered_eeg - mean_per_ch) / std_per_ch
         
-        # Soft clipping
-        filtered_eeg = np.tanh(filtered_eeg * 0.5)
+        # LIGHTER CLIPPING: Preserve signal dynamics
+        # Use gentler clipping to preserve attention-related modulations
+        filtered_eeg = np.tanh(filtered_eeg * 0.3)  # Reduced from 0.5
         
         # Final check for NaNs/Infs
         if np.any(np.isnan(filtered_eeg)) or np.any(np.isinf(filtered_eeg)):
@@ -330,12 +649,17 @@ class FulsangDataset(Dataset):
         tf_data = []
         
         for ch_idx in range(eeg_window.shape[1]):
+            # Compute spectrogram with adaptive parameters
+            # Ensure nperseg is at least 16 and no larger than window length
+            nperseg = max(16, min(64, len(eeg_window) // 2))
+            noverlap = max(8, nperseg // 2)  # 50% overlap, but at least 8 samples
+            
             # Compute spectrogram
             freqs, times, Sxx = signal.spectrogram(
                 eeg_window[:, ch_idx], 
                 fs=self.sampling_rate,
-                nperseg=min(64, len(eeg_window)),  # Adaptive window
-                noverlap=32,  # 50% overlap
+                nperseg=nperseg,
+                noverlap=noverlap,
                 window='hann'
             )
             
@@ -369,17 +693,33 @@ class FulsangDataset(Dataset):
         # Combine channels: (n_channels, n_bands, n_time_points)
         time_freq_array = np.array(tf_data)
         
-        # Interpolate to match window size if needed
-        if time_freq_array.shape[2] != self.window_size:
+        # Current shape: (channels, freq_bands, time_points)
+        # Need to transpose to: (channels, time_points, freq_bands)
+        time_freq_array = np.transpose(time_freq_array, (0, 2, 1))
+        
+        # PRESERVE TEMPORAL RESOLUTION: Don't force interpolation to fixed size
+        # Instead, preserve natural temporal resolution to maintain alignment with trial structure
+        # Only interpolate if absolutely necessary for model compatibility
+        # For 8s window (512 samples), spectrogram naturally produces ~16-32 time points
+        # This preserves temporal alignment better than forcing to 64
+        min_time_points = 8  # Minimum for pooling operations
+        max_time_points = 128  # Maximum to prevent excessive computation
+        
+        # Preserve natural temporal resolution, but ensure minimum for model
+        natural_time_points = time_freq_array.shape[1]
+        target_time_points = max(min_time_points, min(natural_time_points, max_time_points))
+        
+        if time_freq_array.shape[1] != target_time_points:
             from scipy.interpolate import interp1d
-            original_time = np.linspace(0, 1, time_freq_array.shape[2])
-            target_time = np.linspace(0, 1, self.window_size)
+            original_time = np.linspace(0, 1, time_freq_array.shape[1])
+            target_time = np.linspace(0, 1, target_time_points)
             
-            interpolated_data = np.zeros((time_freq_array.shape[0], time_freq_array.shape[1], self.window_size))
+            interpolated_data = np.zeros((time_freq_array.shape[0], target_time_points, time_freq_array.shape[2]))
             for ch in range(time_freq_array.shape[0]):
-                for band in range(time_freq_array.shape[1]):
-                    f_interp = interp1d(original_time, time_freq_array[ch, band, :], kind='linear')
-                    interpolated_data[ch, band, :] = f_interp(target_time)
+                for band in range(time_freq_array.shape[2]):
+                    f_interp = interp1d(original_time, time_freq_array[ch, :, band], kind='linear', 
+                                      bounds_error=False, fill_value='extrapolate')
+                    interpolated_data[ch, :, band] = f_interp(target_time)
             
             time_freq_array = interpolated_data
         
@@ -416,16 +756,42 @@ class FulsangDataset(Dataset):
         if self.transform_eeg:
             try:
                 window_eeg = self._eeg_to_timefreq_fulsang(window_eeg)
+                # window_eeg shape: (channels, time, freq)
+                # Model expects: (channels, time, freq) - this is correct
             except Exception:
-                pass
+                # Fallback: if TF transform fails, create dummy freq dimension
+                # Shape: (time, channels) -> (channels, time, 1)
+                if window_eeg.ndim == 2:
+                    window_eeg = window_eeg.T  # (channels, time)
+                    window_eeg = window_eeg[:, :, np.newaxis]  # (channels, time, 1)
         
-        # Convert to tensors (EEG only)
+        # Convert to tensors
         window_tensor = torch.FloatTensor(window_eeg)
         label_tensor = torch.LongTensor([label])
         
-        # Ensure proper tensor dimensions
+        # Ensure proper tensor dimensions: (channels, time, freq)
         if window_tensor.dim() == 2:
-            window_tensor = window_tensor.unsqueeze(0)  # Add channel dimension
+            # If 2D, assume (time, channels) and transpose to (channels, time)
+            # Then add freq dimension
+            if window_tensor.shape[1] == self.n_channels:
+                # Shape is (time, channels) -> transpose to (channels, time)
+                window_tensor = window_tensor.transpose(0, 1)
+            # Add freq dimension: (channels, time) -> (channels, time, 1)
+            window_tensor = window_tensor.unsqueeze(-1)
+        elif window_tensor.dim() == 3:
+            # Should be (channels, time, freq) - verify
+            if window_tensor.shape[0] != self.n_channels:
+                # If first dim is not channels, might need to transpose
+                if window_tensor.shape[1] == self.n_channels:
+                    # (time, channels, freq) -> (channels, time, freq)
+                    window_tensor = window_tensor.transpose(0, 1)
+                elif window_tensor.shape[2] == self.n_channels:
+                    # (time, freq, channels) -> (channels, time, freq)
+                    window_tensor = window_tensor.permute(2, 0, 1)
+        
+        # Final verification: ensure first dimension is channels
+        if window_tensor.shape[0] != self.n_channels:
+            raise ValueError(f"Expected {self.n_channels} channels in first dimension, got {window_tensor.shape[0]}. Full shape: {window_tensor.shape}")
         
         return window_tensor, label_tensor
 
@@ -528,7 +894,7 @@ class AdaptivePooling(nn.Module):
 class FULCNNBackbone(nn.Module):
     """Backbone network: attention, residual blocks, multi-scale features."""
     
-    def __init__(self, input_channels: int = 66, input_time: int = 32, input_freq: int = 4,
+    def __init__(self, input_channels: int = 66, input_time: int = 32, input_freq: int = 5,
                  adaptive_input: bool = True):
         super(FULCNNBackbone, self).__init__()
         
@@ -537,19 +903,84 @@ class FULCNNBackbone(nn.Module):
         self.input_freq = input_freq
         self.adaptive_input = adaptive_input
         
-        print(f"Building FULCNN backbone: channels={input_channels}, time={input_time}, freq={input_freq}")
+        # Adaptive architecture based on input dimensions
+        # For small inputs, use fewer pooling operations to prevent dimension collapse
+        use_small_architecture = (input_time < 4) or (input_freq < 4)
         
+        if use_small_architecture:
+            print(f"Small input dimensions detected: ({input_time}x{input_freq}). Using adaptive architecture.")
+            self._build_small_input_architecture()
+        else:
+            print(f"Standard input dimensions: ({input_time}x{input_freq}). Using standard architecture.")
+            self._build_standard_architecture()
+        
+        # Calculate output size
+        self._calculate_output_size()
+    
+    def _build_small_input_architecture(self):
+        """Build architecture optimized for small input dimensions."""
+        # For small inputs, reduce pooling operations to prevent dimension collapse
         # Initial multi-scale features
-        self.initial_features = MultiScaleFeatureExtractor(input_channels, 32)
+        self.initial_features = MultiScaleFeatureExtractor(self.input_channels, 32)
         
-        # Temporal blocks
+        # Temporal blocks - conditional pooling based on time dimension
         self.temporal_block1 = ResidualBlock(32, 32, stride=1)
-        self.temporal_pool1 = nn.MaxPool2d((2, 1), (2, 1))
+        if self.input_time >= 2:
+            # Can do one temporal pool if time >= 2
+            self.temporal_pool1 = nn.MaxPool2d((2, 1), (2, 1))
+        else:
+            self.temporal_pool1 = None  # Skip pooling if too small
         
         self.temporal_block2 = ResidualBlock(32, 64, stride=1)
-        self.temporal_pool2 = nn.MaxPool2d((2, 1), (2, 1))
+        # Only do second temporal pool if time >= 4 (after first pool, time would be >= 2)
+        if self.input_time >= 4:
+            self.temporal_pool2 = nn.MaxPool2d((2, 1), (2, 1))
+        else:
+            self.temporal_pool2 = None
         
-        # Spatial blocks
+        # Spatial blocks - conditional pooling based on freq dimension
+        self.spatial_block1 = ResidualBlock(64, 64, stride=1)
+        if self.input_freq >= 2:
+            # Can do one spatial pool if freq >= 2
+            self.spatial_pool1 = nn.MaxPool2d((1, 2), (1, 2))
+        else:
+            self.spatial_pool1 = None
+        
+        self.spatial_block2 = ResidualBlock(64, 128, stride=1)
+        # Only do second spatial pool if freq >= 4 (after first pool, freq would be >= 2)
+        if self.input_freq >= 4:
+            self.spatial_pool2 = nn.MaxPool2d((1, 2), (1, 2))
+        else:
+            self.spatial_pool2 = None
+        
+        # Global attention
+        self.global_attention = SpatialTemporalAttention(128)
+        
+        # Adaptive pooling
+        self.adaptive_pooling = AdaptivePooling(output_size=1)
+    
+    def _build_standard_architecture(self):
+        """
+        Build standard architecture with REDUCED TEMPORAL POOLING.
+        Preserves long-range temporal context needed for attention decoding.
+        """
+        # Initial multi-scale features
+        self.initial_features = MultiScaleFeatureExtractor(self.input_channels, 32)
+        
+        # Temporal blocks - REDUCED POOLING to preserve temporal resolution
+        # Only pool once instead of twice to keep more temporal context
+        self.temporal_block1 = ResidualBlock(32, 32, stride=1)
+        # Single temporal pool (reduced from 2 pools)
+        if self.input_time >= 4:
+            self.temporal_pool1 = nn.MaxPool2d((2, 1), (2, 1))
+        else:
+            self.temporal_pool1 = None
+        
+        self.temporal_block2 = ResidualBlock(32, 64, stride=1)
+        # NO SECOND TEMPORAL POOL - preserve temporal resolution
+        self.temporal_pool2 = None
+        
+        # Spatial blocks - keep spatial pooling (frequency dimension)
         self.spatial_block1 = ResidualBlock(64, 64, stride=1)
         self.spatial_pool1 = nn.MaxPool2d((1, 2), (1, 2))
         
@@ -562,37 +993,45 @@ class FULCNNBackbone(nn.Module):
         # Adaptive pooling
         self.adaptive_pooling = AdaptivePooling(output_size=1)
         
-        # Calculate output size
-        self._calculate_output_size()
-        
     
     def _calculate_output_size(self):
         """Figure out output size by running a dummy input."""
         dummy_input = torch.randn(1, self.input_channels, self.input_time, self.input_freq)
         
-        with torch.no_grad():
-            x = self.forward(dummy_input)
-            self.output_size = x.numel()
+        try:
+            with torch.no_grad():
+                x = self.forward(dummy_input)
+                self.output_size = x.numel()
+        except RuntimeError as e:
+            if "Output size is too small" in str(e):
+                raise ValueError(f"CNNLoc architecture cannot handle input size ({self.input_time}, {self.input_freq}). "
+                               f"Even with adaptive architecture, dimensions become too small after pooling. "
+                               f"Error: {e}")
+            raise
         
     
     def forward(self, x):
-        """Forward pass."""
+        """Forward pass with adaptive architecture support."""
         # Multi-scale features
         x = self.initial_features(x)
         
         # Temporal processing
         x = self.temporal_block1(x)
-        x = self.temporal_pool1(x)
+        if self.temporal_pool1 is not None:
+            x = self.temporal_pool1(x)
         
         x = self.temporal_block2(x)
-        x = self.temporal_pool2(x)
+        if self.temporal_pool2 is not None:
+            x = self.temporal_pool2(x)
         
         # Spatial processing
         x = self.spatial_block1(x)
-        x = self.spatial_pool1(x)
+        if self.spatial_pool1 is not None:
+            x = self.spatial_pool1(x)
         
         x = self.spatial_block2(x)
-        x = self.spatial_pool2(x)
+        if self.spatial_pool2 is not None:
+            x = self.spatial_pool2(x)
         
         # Attention
         x = self.global_attention(x)
@@ -607,25 +1046,22 @@ class FULCNNBackbone(nn.Module):
 class FULCNNModel(nn.Module):
     """Full FULCNN model: backbone + classifier for EEG attention decoding."""
     
-    def __init__(self, input_channels: int = 66, input_time: int = 32, input_freq: int = 4,
+    def __init__(self, input_channels: int = 66, input_time: int = 32, input_freq: int = 5,
                  num_classes: int = 2, dropout_rate: float = 0.3):
         super(FULCNNModel, self).__init__()
         
         # Create backbone
         self.backbone = FULCNNBackbone(input_channels, input_time, input_freq)
         
-        # Classifier
+        # SIMPLIFIED CLASSIFIER: Reduced capacity to match signal-to-noise ratio
+        # For low-SNR attention decoding, simpler is better
         self.classifier = nn.Sequential(
-            nn.Dropout(dropout_rate),
-            nn.Linear(self.backbone.output_size, 128),
-            nn.BatchNorm1d(128),
+            nn.Dropout(dropout_rate * 0.5),  # Reduced dropout
+            nn.Linear(self.backbone.output_size, 64),  # Reduced from 128
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(dropout_rate * 0.5),
-            nn.Linear(128, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(32, num_classes)
+            nn.Dropout(dropout_rate * 0.3),
+            nn.Linear(64, num_classes)  # Direct to output, removed intermediate layer
         )
         
         self._initialize_weights()
@@ -643,8 +1079,13 @@ class FULCNNModel(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
+                # Use proper initialization for Linear layers
+                # Kaiming uniform is better for ReLU activations
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(m.bias, -bound, bound)
     
     def forward(self, x):
         """Forward pass through the model."""
@@ -688,33 +1129,84 @@ class FULCNNTrainer:
         total = 0
         
         for batch_idx, (data, target) in enumerate(tqdm(train_loader, desc="Training")):
-            data, target = data.to(self.device), target.to(self.device)
+            # Move to device (GPU if available) with non_blocking for faster transfer
+            data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
             target = target.squeeze()
+            
+            # Verify GPU usage on first batch
+            if batch_idx == 0:
+                if torch.cuda.is_available():
+                    data_dev = data.device
+                    model_dev = next(self.model.parameters()).device
+                    print(f"  ✓ GPU Verification - Data device: {data_dev}, Model device: {model_dev}")
+                    if data_dev.type != 'cuda' or model_dev.type != 'cuda':
+                        print(f"  ⚠️  WARNING: Not using GPU! Data: {data_dev}, Model: {model_dev}")
+                    else:
+                        print(f"  ✓ GPU memory: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB allocated")
+                else:
+                    print(f"  Using CPU - Data device: {data.device}, Model device: {next(self.model.parameters()).device}")
+            
+            # Validate input data before processing
+            if torch.any(torch.isnan(data)) or torch.any(torch.isinf(data)):
+                print(f"  WARNING: NaN/Inf detected in input data at batch {batch_idx}, skipping...")
+                continue
             
             # Data augmentation
             if self.model.training:
+                # Add small noise (helps with generalization)
                 noise = torch.randn_like(data) * 0.01
                 data = data + noise
                 
-                if torch.rand(1) > 0.5:
-                    shift = torch.randint(-2, 4, (1,)).item()
-                    data = torch.roll(data, shift, dims=2)
+                # Temporal shift augmentation (disabled - can break temporal structure in TF representation)
+                # The time-frequency representation has specific temporal structure that shouldn't be shifted
+                # if torch.rand(1) > 0.5:
+                #     shift = torch.randint(-2, 4, (1,)).item()
+                #     data = torch.roll(data, shift, dims=2)
             
             # Forward
             output = self.model(data)
+            
+            # Debug: Check output shape and values on first batch
+            if batch_idx == 0:
+                print(f"  Debug - Input shape: {data.shape}, Output shape: {output.shape}")
+                print(f"  Debug - Output range: [{output.min().item():.4f}, {output.max().item():.4f}]")
+                print(f"  Debug - Output mean: {output.mean().item():.4f}, std: {output.std().item():.4f}")
+                print(f"  Debug - Target shape: {target.shape}, Target values: {target.unique()}")
+            
+            # Validate output
+            if torch.any(torch.isnan(output)) or torch.any(torch.isinf(output)):
+                print(f"  WARNING: NaN/Inf in model output at batch {batch_idx}, skipping...")
+                output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
+            
             loss = criterion(output, target)
             
-            if torch.isnan(loss):
-                continue
+            # Debug: Check loss on first batch
+            if batch_idx == 0:
+                print(f"  Debug - Loss: {loss.item():.4f}")
+                print(f"  Debug - Predictions: {output.argmax(dim=1)[:5]}, Targets: {target[:5]}")
             
-            if torch.any(torch.isnan(output)):
-                output = torch.nan_to_num(output, nan=0.0)
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"  WARNING: NaN/Inf loss at batch {batch_idx}, skipping...")
+                continue
             
             total_loss += loss.item()
             
             # Backward
             optimizer.zero_grad()
             loss.backward()
+            
+            # Debug: Check gradients on first batch
+            if batch_idx == 0:
+                total_norm = 0
+                param_norm = 0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** (1. / 2)
+                print(f"  Debug - Gradient norm: {total_norm:.6f}")
+                if total_norm < 1e-6:
+                    print(f"  ⚠️  WARNING: Very small gradient norm ({total_norm:.6f}) - model may not be learning!")
             
             # Clip gradients
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -751,11 +1243,23 @@ class FULCNNTrainer:
         
         with torch.no_grad():
             for data, target in tqdm(val_loader, desc="Validation"):
-                data, target = data.to(self.device), target.to(self.device)
+                data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
                 target = target.squeeze()
                 
+                # Validate input
+                if torch.any(torch.isnan(data)) or torch.any(torch.isinf(data)):
+                    continue
+                
                 output = self.model(data)
+                
+                # Validate output
+                if torch.any(torch.isnan(output)) or torch.any(torch.isinf(output)):
+                    output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
+                
                 loss = criterion(output, target)
+                
+                if torch.isnan(loss) or torch.isinf(loss):
+                    continue
                 
                 total_loss += loss.item()
                 pred = output.argmax(dim=1, keepdim=True)
@@ -775,6 +1279,9 @@ class FULCNNTrainer:
               weight_decay: float = 1e-5, patience: int = 10, label_smoothing: float = 0.05):
         """Train the model with class balancing and label smoothing."""
         
+        # Get num_classes from model (from classifier's last layer)
+        num_classes = self.model.classifier[-1].out_features
+        
         # Get class weights for imbalanced data
         labels_list = []
         for _, (_, target) in enumerate(train_loader):
@@ -782,25 +1289,55 @@ class FULCNNTrainer:
         
         unique, counts = np.unique(labels_list, return_counts=True)
         
-        # Calculate weights
-        n_total = len(labels_list)
-        n_classes = len(unique)
+        print(f"Unique classes: {unique}")
+        print(f"Class counts: {counts}")
         
-        if n_classes == 0:
-            print("WARNING: No classes found in training data")
-            weights = torch.ones(2).to(self.device)
+        # Calculate weights - always create weights for all num_classes
+        n_total = len(labels_list)
+        n_classes_found = len(unique)
+        
+        if n_classes_found == 0:
+            print("⚠️  CRITICAL ERROR: No classes found in training data!")
+            print("   This means all labels are the same or invalid.")
+            print("   The model cannot learn without multiple classes.")
+            class_weights = torch.ones(num_classes).to(self.device)
+        elif n_classes_found == 1:
+            print(f"⚠️  CRITICAL ERROR: Only one class found in training data: {unique[0]}")
+            print(f"   Class count: {counts[0]}")
+            print(f"   The model cannot learn binary classification with only one class!")
+            print(f"   Check your data loading and label assignment logic.")
+            # Still create weights, but this will cause the model to fail
+            weights = np.ones(num_classes)
+            if unique[0] < num_classes:
+                weights[unique[0]] = 1.0
+            class_weights = torch.FloatTensor(weights).to(self.device)
         else:
-            # Weight = total_samples / (n_classes * class_count)
-            weights = np.zeros(max(unique) + 1)
+            # Initialize weights to 1.0 for all classes
+            weights = np.ones(num_classes)
+            
+            # Calculate weights for classes that exist in the data
+            # Weight = total_samples / (n_classes_found * class_count)
             for i, cls_id in enumerate(unique):
-                if counts[i] > 0:
-                    weights[cls_id] = n_total / (n_classes * counts[i])
-                else:
-                    weights[cls_id] = 1.0
+                if cls_id < num_classes and counts[i] > 0:
+                    weights[cls_id] = n_total / (n_classes_found * counts[i])
+                elif cls_id >= num_classes:
+                    print(f"WARNING: Found class {cls_id} but model only has {num_classes} classes")
             
             class_weights = torch.FloatTensor(weights).to(self.device)
         
         print(f"Class distribution: {dict(zip(unique, counts))}, weights: {class_weights.cpu().numpy()}")
+        print(f"Class weights applied: {class_weights.cpu().numpy()}")
+        
+        # Check for severe imbalance
+        if n_classes_found == 2:
+            balance_ratio = min(counts) / max(counts)
+            print(f"Class balance ratio: {balance_ratio:.3f} (1.0 = perfectly balanced)")
+            if balance_ratio < 0.1:
+                print(f"⚠️  WARNING: Severe class imbalance (ratio: {balance_ratio:.3f})")
+                print(f"   This will make learning very difficult. Consider:")
+                print(f"   1. Using more aggressive class weights")
+                print(f"   2. Using oversampling/undersampling")
+                print(f"   3. Checking if labels are correct")
         
         # Loss with class weights and label smoothing
         criterion = nn.CrossEntropyLoss(
@@ -819,7 +1356,14 @@ class FULCNNTrainer:
         
         patience_counter = 0
         
-        print(f"Starting training: {num_epochs} epochs, lr={learning_rate}, wd={weight_decay}, label_smoothing={label_smoothing}")
+        print(f"Starting FULCNN training for {num_epochs} epochs...")
+        print(f"Learning rate: {learning_rate}, Weight decay: {weight_decay}")
+        print(f"Label smoothing: {label_smoothing}")
+        print(f"\n⚠️  IMPORTANT: If accuracy stays near 50%, check:")
+        print(f"   1. Window label distribution (should have both classes)")
+        print(f"   2. Model gradients (should be > 1e-6)")
+        print(f"   3. Model output variance (should vary across samples)")
+        print(f"   4. Data preprocessing (may be removing signal)")
         
         for epoch in range(num_epochs):
             print(f"\nEpoch {epoch+1}/{num_epochs}")
@@ -841,6 +1385,35 @@ class FULCNNTrainer:
             print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
             print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
             
+            # Diagnostic: Check if loss is decreasing
+            if epoch > 0:
+                loss_change = self.train_losses[-2] - train_loss
+                if loss_change < 0.001 and epoch > 5:
+                    print(f"⚠️  WARNING: Loss barely decreasing (change: {loss_change:.6f}). Model may not be learning!")
+                    print(f"   Possible causes:")
+                    print(f"   1. Learning rate too small (current: {optimizer.param_groups[0]['lr']:.6f})")
+                    print(f"   2. Model weights not updating (check gradients)")
+                    print(f"   3. Data/labels incorrect")
+                if train_acc < 55.0 and val_acc < 55.0 and epoch > 10:
+                    print(f"⚠️  WARNING: Accuracy stuck near random (50%). Check data quality and labels!")
+                    print(f"   Train acc: {train_acc:.2f}%, Val acc: {val_acc:.2f}%")
+                    print(f"   This suggests the model is not learning the attention signal.")
+                    print(f"   Check: 1) Window label distribution, 2) Model gradients, 3) Data preprocessing")
+            
+            # Check if model predictions are all the same (another sign of not learning)
+            if epoch > 0 and epoch % 5 == 0:
+                # Sample a batch to check prediction diversity
+                sample_batch = next(iter(train_loader))
+                sample_data, sample_target = sample_batch
+                sample_data = sample_data.to(self.device)
+                with torch.no_grad():
+                    sample_output = self.model(sample_data)
+                    sample_preds = sample_output.argmax(dim=1)
+                    unique_preds = torch.unique(sample_preds)
+                    if len(unique_preds) == 1:
+                        print(f"⚠️  WARNING: Model is predicting only class {unique_preds[0].item()} for all samples!")
+                        print(f"   This indicates the model is not learning. Check gradients and data.")
+            
             if val_acc > self.best_val_acc:
                 self.best_val_acc = val_acc
                 patience_counter = 0
@@ -856,8 +1429,12 @@ class FULCNNTrainer:
                 patience_counter += 1
             
             if patience_counter >= patience:
-                print(f"Early stopping after {patience} epochs without improvement")
+                print(f"Early stopping after {patience_counter} epochs without improvement (patience={patience})")
                 break
+            
+            # Print patience status
+            if epoch % 5 == 0 or patience_counter > 0:
+                print(f"  Patience: {patience_counter}/{patience} (no improvement for {patience_counter} epochs)")
         
         print(f"Training completed. Best validation accuracy: {self.best_val_acc:.4f}")
         return self.best_val_acc
@@ -907,11 +1484,33 @@ class FULCNNTrainer:
         
         cm = confusion_matrix(targets, preds)
         
+        # CRITICAL: Check if model is performing worse than random
+        if accuracy < 0.5:
+            print(f"\n⚠️  CRITICAL WARNING: Test accuracy ({accuracy:.4f}) is below random chance (0.5)!")
+            print(f"   This indicates a fundamental problem with the data, labels, or model.")
+        elif accuracy < 0.55:
+            print(f"\n⚠️  WARNING: Test accuracy ({accuracy:.4f}) is barely above random chance.")
+            print(f"   The model is not learning effectively.")
+        
         # Calculate metrics
         roc_auc_metrics = self._calculate_roc_auc_metrics(targets, probs)
         msed_metrics = self._calculate_msed_metrics(targets, preds)
         advanced_metrics = self._calculate_advanced_metrics(targets, preds)
         temporal_metrics = self._calculate_temporal_metrics(test_loader)
+        
+        # Check ROC-AUC (should be > 0.5 for a useful model)
+        roc_auc = roc_auc_metrics.get('roc_auc_score', 0.5)
+        if roc_auc < 0.5:
+            print(f"\n⚠️  CRITICAL: ROC-AUC ({roc_auc:.4f}) is below 0.5!")
+            print(f"   This means the model is performing WORSE than random guessing.")
+            print(f"   Possible causes:")
+            print(f"   1. Labels are incorrect or reversed")
+            print(f"   2. Data preprocessing removed the signal")
+            print(f"   3. Model architecture is inappropriate for this task")
+            print(f"   4. Severe class imbalance or data leakage")
+        elif roc_auc < 0.55:
+            print(f"\n⚠️  WARNING: ROC-AUC ({roc_auc:.4f}) is barely above random (0.5).")
+            print(f"   The model is not learning the attention signal effectively.")
         
         results = {
             'accuracy': accuracy,
@@ -1042,8 +1641,8 @@ class FULCNNTrainer:
     
     def _calculate_temporal_metrics(self, test_loader: DataLoader) -> Dict[str, float]:
         """Calculate real temporal performance metrics across different window sizes."""
-        # Test different window sizes (in seconds)
-        window_sizes_seconds = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+        # Test different window sizes (in seconds) - 1s to 30s
+        window_sizes_seconds = [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
         temporal_analysis = {}
         flat_results = {}
         
@@ -1074,6 +1673,37 @@ class FULCNNTrainer:
                 
                 if len(temp_dataset) == 0:
                     continue
+                
+                # Check if the dataset produces valid dimensions for the model
+                sample_data, _ = temp_dataset[0]
+                if sample_data.dim() == 3:
+                    temp_channels, temp_time, temp_freq = sample_data.shape
+                    model_channels = self.model.backbone.input_channels
+                    model_freq = self.model.backbone.input_freq
+                    
+                    # Check channel and frequency dimensions (must match)
+                    if temp_channels != model_channels:
+                        print(f"Skipping {window_sec}s window: channel mismatch. "
+                              f"Dataset produces {temp_channels} channels, model expects {model_channels}")
+                        continue
+                    
+                    if temp_freq != model_freq:
+                        print(f"Skipping {window_sec}s window: frequency mismatch. "
+                              f"Dataset produces {temp_freq} freq bands, model expects {model_freq}")
+                        continue
+                    
+                    # Time dimension can vary - model uses adaptive pooling to handle this
+                    # But check if dimensions are too small for pooling operations
+                    if temp_time < 4 or temp_freq < 4:
+                        print(f"Skipping {window_sec}s window: dimensions too small ({temp_time}x{temp_freq}) "
+                              f"for CNNLoc pooling operations (requires >= 4x4)")
+                        continue
+                    
+                    # MEANINGFUL TEMPORAL ANALYSIS: Report actual temporal resolution
+                    # Different window sizes should show different performance if model is learning temporal patterns
+                    print(f"Testing {window_sec}s window: shape ({temp_channels}, {temp_time}, {temp_freq})")
+                    print(f"  Actual temporal resolution: {temp_time} time bins (model initialized for {self.model.backbone.input_time})")
+                    print(f"  ⚠️  NOTE: If performance is similar across all window sizes, model may be ignoring temporal scale")
                 
                 temp_loader = DataLoader(temp_dataset, batch_size=16, shuffle=False)
                 
@@ -1106,7 +1736,24 @@ class FULCNNTrainer:
                     
             except Exception as e:
                 print(f"Error testing {window_sec}s window: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
+        
+        # MEANINGFUL TEMPORAL ANALYSIS: Check if performance varies with window size
+        # If all window sizes perform similarly, the model is ignoring temporal scale (bad)
+        acc_range = 0.0
+        if len(temporal_analysis) > 1:
+            accuracies = [metrics['accuracy'] for metrics in temporal_analysis.values()]
+            acc_range = max(accuracies) - min(accuracies)
+            
+            if acc_range < 0.05:  # Less than 5% difference
+                print(f"\n⚠️  WARNING: Temporal analysis shows <5% variation across window sizes ({acc_range:.3f})")
+                print(f"   This suggests the model is INVARIANT to temporal scale, which is wrong for attention decoding.")
+                print(f"   The model should perform better on longer windows that capture more trial context.")
+            else:
+                print(f"\n✓ Temporal analysis shows meaningful variation: {acc_range:.3f} accuracy range")
+                print(f"   This suggests the model is learning temporal-scale-dependent patterns.")
         
         # Find the best window size
         best_window = None
@@ -1117,102 +1764,42 @@ class FULCNNTrainer:
                 best_window = window_key
         
         # Return structured results
+        note_str = 'No valid temporal analysis completed'
+        if best_window:
+            if len(temporal_analysis) > 1:
+                note_str = f'Best performance at {best_window}s window with {best_accuracy:.3f} accuracy. Temporal variation: {acc_range:.3f}'
+            else:
+                note_str = f'Best performance at {best_window}s window with {best_accuracy:.3f} accuracy'
+        
         return {
             'temporal_analysis': temporal_analysis,
             'recommended_window_size': best_window if best_window else 'N/A',
-            'note': f'Best performance at {best_window}s window with {best_accuracy:.3f} accuracy' if best_window else 'No valid temporal analysis completed',
+            'temporal_variation': acc_range,
+            'note': note_str,
             **flat_results  # Keep flat results for backward compatibility
         }
     
     def _test_larger_window(self, test_loader: DataLoader, window_samples: int, window_sec: float) -> Dict[str, float]:
-        """Test larger window sizes by creating overlapping windows from test data."""
-        # Collect all test data
-        all_data = []
-        all_targets = []
+        """
+        DEPRECATED: This method is conceptually wrong.
         
-        self.model.eval()
-        with torch.no_grad():
-            for data, target in test_loader:
-                all_data.append(data.cpu())
-                all_targets.append(target.cpu())
+        You cannot create larger windows from already-processed windows.
+        The test_loader contains windows that have already been:
+        1. Extracted from raw data
+        2. Preprocessed
+        3. Converted to time-frequency representation
+        4. Interpolated to a fixed size
         
-        if not all_data:
-            return {}
+        To test larger windows, you must go back to the RAW data and create
+        new windows from scratch. This is now handled in _calculate_temporal_metrics
+        by creating new FulsangDataset instances with different window sizes.
         
-        # Concatenate all test data
-        all_data = torch.cat(all_data, dim=0)  # (total_samples, channels, time, freq)
-        all_targets = torch.cat(all_targets, dim=0)  # (total_samples,)
-        
-        # For larger windows, we need to create overlapping windows from the test data
-        # But the model expects the same input shape as training
-        predictions = []
-        targets = []
-        
-        # Calculate step size for overlapping windows
-        step_size = max(1, window_samples // 4)  # 75% overlap
-        
-        for start_idx in range(0, all_data.shape[0] - window_samples + 1, step_size):
-            # Extract window
-            window_data = all_data[start_idx:start_idx + window_samples]  # (window_samples, channels, time, freq)
-            
-            # For larger windows, we need to downsample to match the model's expected input size
-            # The model was trained on 32 samples, so we need to downsample to 32
-            if window_data.shape[0] > 1:
-                # Downsample by taking every nth sample to get to 32 samples
-                target_samples = 32  # Model's expected input size
-                if window_samples > target_samples:
-                    # Calculate step size for downsampling
-                    step = window_samples // target_samples
-                    window_data = window_data[::step][:target_samples]  # Take every step-th sample
-                else:
-                    # If window is smaller than target, repeat samples
-                    repeats = target_samples // window_samples
-                    remainder = target_samples % window_samples
-                    window_data = window_data.repeat(repeats, 1, 1, 1)
-                    if remainder > 0:
-                        window_data = torch.cat([window_data, window_data[:remainder]], dim=0)
-            
-            # Ensure we have exactly 32 samples
-            if window_data.shape[0] != 32:
-                # Pad or truncate to exactly 32 samples
-                if window_data.shape[0] < 32:
-                    # Pad with the last sample
-                    padding = 32 - window_data.shape[0]
-                    last_sample = window_data[-1:].repeat(padding, 1, 1, 1)
-                    window_data = torch.cat([window_data, last_sample], dim=0)
-                else:
-                    # Truncate to 32 samples
-                    window_data = window_data[:32]
-            
-            # Now window_data should be (32, channels, time, freq)
-            # We need to reshape to (1, channels, time, freq) for the model
-            window_data = window_data.mean(dim=0, keepdim=True)  # Average across the 32 samples
-            
-            # Get the target for the middle of the window
-            middle_idx = start_idx + window_samples // 2
-            if middle_idx < len(all_targets):
-                window_target = all_targets[middle_idx]
-            else:
-                window_target = all_targets[-1]
-            
-            # Predict
-            window_data = window_data.to(self.device)
-            with torch.no_grad():
-                output = self.model(window_data)
-                pred = output.argmax(dim=1)
-                predictions.append(pred.cpu().item())
-                targets.append(window_target.item())
-        
-        if len(predictions) > 0:
-            accuracy = accuracy_score(targets, predictions)
-            f1 = f1_score(targets, predictions, average='weighted')
-            
-            return {
-                f'accuracy_{window_sec}s': accuracy,
-                f'f1_{window_sec}s': f1
-            }
-        else:
-            return {}
+        This method is kept for backward compatibility but should not be used.
+        """
+        # This method is no longer used - temporal analysis now creates
+        # new datasets directly in _calculate_temporal_metrics
+        print(f"WARNING: _test_larger_window called but is deprecated. Use new dataset creation instead.")
+        return {}
     
     def save_results(self, results: Dict):
         """Save comprehensive results to files."""
@@ -1314,10 +1901,21 @@ class FULCNNTrainer:
             
             # Temporal analysis
             temporal = results.get('temporal_metrics', {})
-            f.write("TEMPORAL PERFORMANCE ANALYSIS:\n")
-            f.write("-" * 40 + "\n")
-            for window_size, metrics in temporal.get("temporal_analysis", {}).items():
-                f.write(f"{window_size}: {metrics.get('accuracy', 'N/A'):.4f}\n")
+            temporal_analysis = temporal.get("temporal_analysis", {})
+            f.write("TEMPORAL PERFORMANCE ANALYSIS (1s to 30s Windows):\n")
+            f.write("=" * 80 + "\n")
+            if temporal_analysis:
+                f.write(f"{'Window Size':<15} {'Accuracy':<15} {'F1 Score':<15}\n")
+                f.write("-" * 80 + "\n")
+                # Sort by window size
+                sorted_windows = sorted(temporal_analysis.keys(), 
+                                       key=lambda x: float(x.replace('s', '')))
+                for window_size in sorted_windows:
+                    metrics = temporal_analysis[window_size]
+                    acc = metrics.get('accuracy', 0.0)
+                    f1 = metrics.get('f1', 0.0)
+                    f.write(f"{window_size:<15} {acc:<15.4f} {f1:<15.4f}\n")
+            f.write("=" * 80 + "\n")
             f.write(f"\nRecommended: {temporal.get('recommended_window_size', 'N/A')}\n")
             f.write(f"Note: {temporal.get('note', 'N/A')}\n")
             
@@ -1365,7 +1963,7 @@ class FULCNNTrainer:
 
 
 def create_fulsang_data_loaders(tfrecord_dir: str, batch_size: int = 16, 
-                               window_size: int = 32, overlap: float = 0.5,
+                               window_size: int = 512, overlap: float = 0.5,
                                train_ratio: float = 0.7, val_ratio: float = 0.15,
                                max_samples: Optional[int] = None, 
                                num_workers: int = 0, pin_memory: bool = False) -> Tuple[DataLoader, DataLoader, DataLoader]:
@@ -1384,9 +1982,26 @@ def create_fulsang_data_loaders(tfrecord_dir: str, batch_size: int = 16,
     subject_windows = {}
     
     # Group metadata by subject
+    # This creates ranges in the metadata array (which should align with data array)
     subject_ranges = {}
     current_subject = None
     start_idx = 0
+    
+    print(f"\nAnalyzing {len(full_dataset.metadata)} metadata entries for subject grouping...")
+    
+    # First, check what subject IDs we actually have
+    unique_subjects_in_metadata = set()
+    for metadata in full_dataset.metadata:
+        subject_id = metadata.get('subject_id', 'unknown')
+        unique_subjects_in_metadata.add(subject_id)
+    
+    print(f"Found {len(unique_subjects_in_metadata)} unique subject IDs in metadata: {sorted(unique_subjects_in_metadata)}")
+    
+    if len(unique_subjects_in_metadata) == 1:
+        print(f"⚠️  CRITICAL: Only 1 unique subject ID found: {list(unique_subjects_in_metadata)[0]}")
+        print(f"   This means subject-wise split CANNOT work!")
+        print(f"   All data will be treated as from the same subject")
+        print(f"   Check if subject_id is being properly extracted from TFRecords")
     
     for i, metadata in enumerate(full_dataset.metadata):
         subject_id = metadata.get('subject_id', 'unknown')
@@ -1401,32 +2016,114 @@ def create_fulsang_data_loaders(tfrecord_dir: str, batch_size: int = 16,
     if current_subject is not None:
         subject_ranges[current_subject] = (start_idx, len(full_dataset.metadata))
     
+    print(f"Created {len(subject_ranges)} subject ranges:")
+    for subj_id, (start, end) in subject_ranges.items():
+        print(f"  {subj_id}: metadata indices {start}-{end} ({end-start} samples)")
+    
     # Map windows to subjects
+    # IMPORTANT: Windows are mapped based on where they START (data_idx)
+    # If a window spans subjects, it's assigned to the subject where it starts
+    print(f"\nMapping {len(full_dataset.window_indices)} windows to subjects...")
+    print(f"Subject ranges in metadata: {len(subject_ranges)} subjects")
+    for subj_id, (start, end) in subject_ranges.items():
+        print(f"  {subj_id}: samples {start}-{end} ({end-start} samples)")
+    
+    unmapped_windows = 0
     for i, (data_idx, label) in enumerate(full_dataset.window_indices):
         subject_id = "unknown"
         
-        # Find subject for this window
+        # Find subject for this window based on where it starts
+        # Note: If window spans subjects, it's assigned to the starting subject
         for subj_id, (start_idx, end_idx) in subject_ranges.items():
             if start_idx <= data_idx < end_idx:
                 subject_id = subj_id
                 break
         
+        # Check if window might span subjects
+        window_end = data_idx + full_dataset.window_size
+        if subject_id != "unknown":
+            # Check if window extends beyond subject boundary
+            subj_start, subj_end = subject_ranges[subject_id]
+            if window_end > subj_end:
+                print(f"WARNING: Window {i} (data_idx={data_idx}) spans subject boundary! "
+                      f"Starts in {subject_id} (ends at {subj_end}) but window ends at {window_end}")
+        
+        if subject_id == "unknown":
+            unmapped_windows += 1
+            # Try to find by checking if data_idx is out of bounds
+            if data_idx >= len(full_dataset.metadata):
+                print(f"ERROR: Window {i} has data_idx={data_idx} but metadata only has {len(full_dataset.metadata)} entries")
+        
         if subject_id not in subject_windows:
             subject_windows[subject_id] = []
         subject_windows[subject_id].append(i)
     
-    # Split by subject (prevents data leakage)
+    if unmapped_windows > 0:
+        print(f"WARNING: {unmapped_windows} windows could not be mapped to subjects!")
+    
+    print(f"Mapped windows to {len(subject_windows)} subjects:")
+    for subj_id, window_list in subject_windows.items():
+        print(f"  {subj_id}: {len(window_list)} windows")
+    
+    # Analyze label distribution per subject BEFORE splitting
+    subject_label_distributions = {}
+    print(f"\nAnalyzing label distribution per subject (before split):")
+    for subject_id, window_indices_list in subject_windows.items():
+        subject_labels = [full_dataset.window_indices[i][1] for i in window_indices_list]
+        label_dist = np.bincount(subject_labels)
+        subject_label_distributions[subject_id] = label_dist
+        
+        # Show detailed info for each subject
+        total_windows = len(window_indices_list)
+        class_0_count = label_dist[0] if len(label_dist) > 0 else 0
+        class_1_count = label_dist[1] if len(label_dist) > 1 else 0
+        
+        if len(label_dist) < 2:
+            print(f"  ⚠️  {subject_id}: {total_windows} windows, ONLY class {np.argmax(label_dist)} ({class_0_count if len(label_dist) == 1 else 'N/A'} windows)")
+        else:
+            print(f"  ✓ {subject_id}: {total_windows} windows, class 0: {class_0_count}, class 1: {class_1_count} (balance: {min(class_0_count, class_1_count)/max(class_0_count, class_1_count):.2f})")
+    
+    # Split by subject (simple random split - preserves natural class imbalance)
+    # Note: We do NOT balance classes - the dataset is naturally unbalanced
     subjects = list(subject_windows.keys())
     np.random.seed(42)  # Reproducibility
     np.random.shuffle(subjects)
     
+    # Calculate split sizes
     n_subjects = len(subjects)
     n_train_subjects = int(train_ratio * n_subjects)
     n_val_subjects = int(val_ratio * n_subjects)
     
+    # Simple random split (preserves natural class distribution)
     train_subjects = subjects[:n_train_subjects]
     val_subjects = subjects[n_train_subjects:n_train_subjects + n_val_subjects]
     test_subjects = subjects[n_train_subjects + n_val_subjects:]
+    
+    print(f"\nSubject split:")
+    print(f"  Train subjects ({len(train_subjects)}): {train_subjects}")
+    print(f"  Val subjects ({len(val_subjects)}): {val_subjects}")
+    print(f"  Test subjects ({len(test_subjects)}): {test_subjects}")
+    
+    # Show label distribution for subjects in each split BEFORE creating indices
+    print(f"\nLabel distribution for subjects in each split:")
+    
+    print(f"  Training subjects:")
+    for subj_id in train_subjects:
+        if subj_id in subject_label_distributions:
+            dist = subject_label_distributions[subj_id]
+            print(f"    {subj_id}: {dict(enumerate(dist))}")
+    
+    print(f"  Validation subjects:")
+    for subj_id in val_subjects:
+        if subj_id in subject_label_distributions:
+            dist = subject_label_distributions[subj_id]
+            print(f"    {subj_id}: {dict(enumerate(dist))}")
+    
+    print(f"  Test subjects:")
+    for subj_id in test_subjects:
+        if subj_id in subject_label_distributions:
+            dist = subject_label_distributions[subj_id]
+            print(f"    {subj_id}: {dict(enumerate(dist))}")
     
     # Get window indices for each split
     train_indices = []
@@ -1457,6 +2154,31 @@ def create_fulsang_data_loaders(tfrecord_dir: str, batch_size: int = 16,
     val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
     test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
     
+    # Check label distribution in each split (debug for data leakage)
+    train_labels = [full_dataset.window_indices[i][1] for i in train_indices]
+    val_labels = [full_dataset.window_indices[i][1] for i in val_indices]
+    test_labels = [full_dataset.window_indices[i][1] for i in test_indices]
+    
+    train_label_dist = np.bincount(train_labels)
+    val_label_dist = np.bincount(val_labels)
+    test_label_dist = np.bincount(test_labels)
+    
+    print(f"\nLabel distribution check (to detect data issues):")
+    print(f"  Train: {dict(enumerate(train_label_dist))}")
+    print(f"  Val:   {dict(enumerate(val_label_dist))}")
+    print(f"  Test:  {dict(enumerate(test_label_dist))}")
+    
+    # Note: Unbalanced classes are expected - the algorithm handles this with class weights
+    if len(train_label_dist) < 2:
+        print(f"\nNOTE: Training set has only {len(train_label_dist)} class(es).")
+        print(f"   This is expected for unbalanced datasets.")
+        print(f"   The model will use class weights to handle the imbalance.")
+    
+    if len(val_label_dist) < 2:
+        print(f"NOTE: Validation set has only {len(val_label_dist)} class(es).")
+    if len(test_label_dist) < 2:
+        print(f"NOTE: Test set has only {len(test_label_dist)} class(es).")
+    
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
                              num_workers=num_workers, pin_memory=pin_memory)
@@ -1473,20 +2195,24 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='FULCNN - CNN-LOC for Fulsang Dataset')
-    parser.add_argument('--tfrecord_dir', type=str, default='fulsang_preprocessed/tfrecords',
+    parser.add_argument('--tfrecord_dir', type=str, default='Preprocessed_FulsangNorm/tfrecords',
                        help='TFRecord directory path')
-    parser.add_argument('--batch_size', type=int, default=32,
-                       help='Batch size for training')
+    parser.add_argument('--batch_size', type=int, default=16,
+                       help='Batch size for training (default: 16 - best from hyperparameter tuning)')
     parser.add_argument('--num_epochs', type=int, default=100,
                        help='Number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=2e-4,
-                       help='Learning rate')
+    parser.add_argument('--learning_rate', type=float, default=5e-3,
+                       help='Learning rate (default: 5e-3 - best from hyperparameter tuning)')
     parser.add_argument('--window_size', type=int, default=512,
                        help='Window size for EEG data (512 samples = 8 seconds at 64Hz)')
+    parser.add_argument('--num_workers', type=int, default=None,
+                       help='Number of data loading workers (default: auto-detect, 4 for GPU, 2 for CPU)')
+    parser.add_argument('--pin_memory', action='store_true', default=None,
+                       help='Use pin_memory for faster GPU transfer (default: auto-enable for GPU)')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                        help='Weight decay for regularization')
-    parser.add_argument('--dropout_rate', type=float, default=0.4,
-                       help='Dropout rate')
+    parser.add_argument('--dropout_rate', type=float, default=0.20,
+                       help='Dropout rate (default: 0.20 - best from hyperparameter tuning)')
     parser.add_argument('--label_smoothing', type=float, default=0.1,
                        help='Label smoothing factor')
     parser.add_argument('--output_dir', type=str, default='fulcnn_results',
@@ -1505,24 +2231,70 @@ def main():
         device = torch.device('cpu')
         print("Using CPU (GPU not available)")
     
-    # Create data loaders
+    # Create data loaders with optimized settings for speed
+    # Use multiple workers for parallel data loading and pin_memory for faster GPU transfer
+    if args.num_workers is None:
+        num_workers = 4 if torch.cuda.is_available() else 2  # More workers for GPU training
+    else:
+        num_workers = args.num_workers
+    
+    if args.pin_memory is None:
+        pin_memory = torch.cuda.is_available()  # Pin memory for faster GPU transfer
+    else:
+        pin_memory = args.pin_memory
+    
+    print(f"Data loading settings: batch_size={args.batch_size}, num_workers={num_workers}, pin_memory={pin_memory}")
+    
     train_loader, val_loader, test_loader = create_fulsang_data_loaders(
         args.tfrecord_dir, batch_size=args.batch_size, window_size=args.window_size,
-        max_samples=None, num_workers=0, pin_memory=False
+        max_samples=None, num_workers=num_workers, pin_memory=pin_memory
     )
     
-    # Get input dimensions from data
+    # Get input dimensions from data (check dynamically, don't hardcode)
     if len(train_loader.dataset) > 0:
         sample_data, _ = next(iter(train_loader))
         actual_channels = sample_data.shape[1]
         actual_time = sample_data.shape[2]
         actual_freq = sample_data.shape[3]
         print(f"Input dimensions: channels={actual_channels}, time={actual_time}, freq={actual_freq}")
+        print(f"✓ Detected {actual_channels} channels from data (not hardcoded)")
     else:
-        actual_channels = 66  # EEG channels
-        actual_time = 32
-        actual_freq = 4
-        print(f"Using defaults: channels={actual_channels}, time={actual_time}, freq={actual_freq}")
+        # Fallback: get from dataset
+        full_dataset = FulsangDataset(args.tfrecord_dir, mode='full', window_size=args.window_size)
+        actual_channels = full_dataset.n_channels
+        # Get actual dimensions from a sample
+        try:
+            if len(full_dataset) > 0:
+                sample_data, _ = full_dataset[0]
+                actual_time = sample_data.shape[1]  # time dimension
+                actual_freq = sample_data.shape[2] if sample_data.dim() > 2 else 5  # freq dimension or default (5 bands from spectrogram)
+                print(f"Using dimensions from dataset: channels={actual_channels}, time={actual_time}, freq={actual_freq}")
+                
+                # Validate dimensions for CNNLoc architecture (requires time>=4, freq>=4 for pooling)
+                if actual_time < 4:
+                    raise ValueError(f"CNNLoc requires time >= 4, but dataset produces time={actual_time}. "
+                                   f"This will cause MaxPool2d operations to fail.")
+                if actual_freq < 4:
+                    raise ValueError(f"CNNLoc requires freq >= 4, but dataset produces freq={actual_freq}. "
+                                   f"This will cause MaxPool2d operations to fail.")
+            else:
+                # Ultimate fallback - estimate time dimension (after TF transform and interpolation)
+                # The TF transform interpolates to target_time_points = max(8, min(window_size//4, 64))
+                target_time_points = max(8, min(args.window_size // 4, 64))
+                actual_time = target_time_points
+                actual_freq = 5  # 5 frequency bands from spectrogram (Delta, Theta, Alpha, Beta, Gamma)
+                print(f"Using fallback defaults: channels={actual_channels}, time={actual_time}, freq={actual_freq}")
+                
+                # Validate fallback dimensions
+                if actual_time < 4:
+                    print(f"WARNING: Fallback time={actual_time} < 4, may cause CNNLoc pooling errors")
+                if actual_freq < 4:
+                    print(f"WARNING: Fallback freq={actual_freq} < 4, may cause CNNLoc pooling errors")
+        except Exception as e:
+            print(f"Error getting dimensions: {e}")
+            actual_time = args.window_size
+            actual_freq = 5
+            print(f"Using ultimate fallback: channels={actual_channels}, time={actual_time}, freq={actual_freq}")
     
     # Create model
     print(f"Creating model: channels={actual_channels}, time={actual_time}, freq={actual_freq}")
@@ -1538,6 +2310,27 @@ def main():
     
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
     
+    # Verify GPU usage
+    if torch.cuda.is_available():
+        print(f"\nGPU Verification:")
+        print(f"  Device: {device}")
+        print(f"  GPU Name: {torch.cuda.get_device_name(0)}")
+        print(f"  GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        # Check if model is on GPU
+        model_device = next(model.parameters()).device
+        print(f"  Model device: {model_device}")
+        if model_device.type != 'cuda':
+            print(f"  WARNING: Model is not on GPU! Moving to GPU...")
+            model = model.to(device)
+        else:
+            print(f"  ✓ Model is on GPU")
+        # Test GPU with a dummy tensor
+        test_tensor = torch.randn(1, 1, 1, 1).to(device)
+        print(f"  GPU test tensor device: {test_tensor.device}")
+        print(f"  ✓ GPU is ready for training\n")
+    else:
+        print("  Using CPU (GPU not available)\n")
+    
     # Create trainer
     trainer = FULCNNTrainer(model, device, args.output_dir, args.tfrecord_dir, 
                            sampling_rate=64, window_size=args.window_size)
@@ -1545,6 +2338,7 @@ def main():
     # Clear GPU memory
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        print(f"GPU memory after model creation: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB / {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     
     # Train
     best_val_acc = trainer.train(
@@ -1573,10 +2367,33 @@ def main():
     if "error" not in msed:
         print(f"RMSE: {msed.get('rmse', 'N/A'):.4f}")
     
+    # Display temporal analysis table
     temporal = results.get('temporal_metrics', {})
-    print(f"Recommended window size: {temporal.get('recommended_window_size', 'N/A')}")
+    temporal_analysis = temporal.get('temporal_analysis', {})
     
-    print(f"Results saved to: {args.output_dir}")
+    if temporal_analysis:
+        print("\n" + "=" * 80)
+        print("TEMPORAL PERFORMANCE ANALYSIS (1s to 30s Windows)")
+        print("=" * 80)
+        print(f"{'Window Size':<15} {'Accuracy':<15} {'F1 Score':<15}")
+        print("-" * 80)
+        
+        # Sort by window size (convert '1.0s' to float for sorting)
+        sorted_windows = sorted(temporal_analysis.keys(), 
+                               key=lambda x: float(x.replace('s', '')))
+        
+        for window_size in sorted_windows:
+            metrics = temporal_analysis[window_size]
+            acc = metrics.get('accuracy', 0.0)
+            f1 = metrics.get('f1', 0.0)
+            print(f"{window_size:<15} {acc:<15.4f} {f1:<15.4f}")
+        
+        print("=" * 80)
+        print(f"Recommended window size: {temporal.get('recommended_window_size', 'N/A')}")
+    else:
+        print(f"Recommended window size: {temporal.get('recommended_window_size', 'N/A')}")
+    
+    print(f"\nResults saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":

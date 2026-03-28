@@ -130,30 +130,28 @@ for package in additional_packages:
 check_fulsang_data() {
     echo "Checking if Fulsang Data is Available"
     
-    # Look for the preprocessed data
-    if [ -d "fulsang_preprocessed/tfrecords" ]; then
-        tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
-        echo "Found preprocessed data from FULPREPROCESSING"
+    # Look for the preprocessed data (check both old and new locations)
+    if [ -d "Preprocessed_FulsangNorm/tfrecords" ]; then
+        tfrecord_count=$(find Preprocessed_FulsangNorm/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
+        echo "Found preprocessed data from FULPREPROCESSING_PYTHON"
         echo "Found $tfrecord_count TFRecord files"
         echo "Data leakage prevention is on"
         echo "Attention labels have been validated"
-        
-        # Check if there are any reports
-        if [ -d "fulsang_preprocessed/reports" ]; then
-            echo "Found preprocessing reports"
-        fi
-        
+        return 0
+    elif [ -d "fulsang_preprocessed/tfrecords" ]; then
+        tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
+        echo "Found preprocessed data from FULPREPROCESSING (legacy)"
+        echo "Found $tfrecord_count TFRecord files"
         return 0
     else
         echo "Couldn't find preprocessed data!"
-        echo "Expected location: fulsang_preprocessed/tfrecords"
+        echo "Expected locations: Preprocessed_FulsangNorm/tfrecords or fulsang_preprocessed/tfrecords"
         echo ""
         echo "This probably means:"
-        echo "  1. FULPREPROCESSING.py hasn't been run yet"
+        echo "  1. FULPREPROCESSING_PYTHON.py hasn't been run yet"
         echo "  2. The data is somewhere else"
         echo ""
-        echo "You'll need to run FULPREPROCESSING.py first to create the validated data"
-        echo "We disabled the old data loading to make sure we only use good quality data"
+        echo "You'll need to run FULPREPROCESSING_PYTHON.py first to create the validated data"
         return 1
     fi
 }
@@ -162,17 +160,25 @@ check_fulsang_data() {
 run_fulsang_preprocessing() {
     echo "Running Fulsang Preprocessing"
     
+    # Check for DATA_preproc directory
+    if [ ! -d "/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc" ]; then
+        echo "ERROR: DATA_preproc directory not found at /home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc"
+        return 1
+    fi
+    
     # Run the preprocessing script
-    if [ -f "FULPREPROCESSING.py" ]; then
-        echo "Running FULPREPROCESSING.py..."
-        python3 FULPREPROCESSING.py --data_dir "Data/Fulsang" --output_dir "fulsang_preprocessed" > fulsang_preprocessing_fulcnn.log 2>&1
+    if [ -f "FULPREPROCESSING_PYTHON.py" ]; then
+        echo "Running FULPREPROCESSING_PYTHON.py..."
+        python3 FULPREPROCESSING_PYTHON.py \
+            --data_preproc_path "/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc" \
+            --output_dir "Preprocessed_FulsangNorm" > fulsang_preprocessing_fulcnn.log 2>&1
         
         if [ $? -eq 0 ]; then
             echo "Preprocessing finished successfully"
-            echo "Results are in fulsang_preprocessed/"
+            echo "Results are in Preprocessed_FulsangNorm/"
             
-            if [ -d "fulsang_preprocessed/tfrecords" ]; then
-                tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
+            if [ -d "Preprocessed_FulsangNorm/tfrecords" ]; then
+                tfrecord_count=$(find Preprocessed_FulsangNorm/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
                 echo "Created $tfrecord_count TFRecord files"
                 return 0
             else
@@ -185,7 +191,7 @@ run_fulsang_preprocessing() {
             return 1
         fi
     else
-        echo "Couldn't find FULPREPROCESSING.py!"
+        echo "Couldn't find FULPREPROCESSING_PYTHON.py!"
         return 1
     fi
 }
@@ -199,13 +205,18 @@ run_fulcnn_training() {
         return 1
     fi
     
-    if [ ! -d "fulsang_preprocessed/tfrecords" ]; then
+    # Check for TFRecord directory (prefer new location, fallback to old)
+    if [ -d "Preprocessed_FulsangNorm/tfrecords" ]; then
+        TFRecord_DIR="Preprocessed_FulsangNorm/tfrecords"
+    elif [ -d "fulsang_preprocessed/tfrecords" ]; then
+        TFRecord_DIR="fulsang_preprocessed/tfrecords"
+    else
         echo "No TFRecord data found! Run preprocessing first"
         return 1
     fi
     
     echo "Starting FULCNN training for the Fulsang dataset..."
-    TFRecord_DIR="fulsang_preprocessed/tfrecords"
+    echo "Using TFRecord directory: $TFRecord_DIR"
     
     # Run the training with hyperparameters that don't use too much memory
     python3 FULCNN.py \
@@ -376,9 +387,12 @@ create_final_summary() {
     
     # Check how preprocessing went
     echo "Preprocessing Results:"
-    if [ -d "fulsang_preprocessed/tfrecords" ]; then
-        tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
+    if [ -d "Preprocessed_FulsangNorm/tfrecords" ]; then
+        tfrecord_count=$(find Preprocessed_FulsangNorm/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
         echo "Found validated preprocessed data: $tfrecord_count TFRecord files"
+    elif [ -d "fulsang_preprocessed/tfrecords" ]; then
+        tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
+        echo "Found validated preprocessed data (legacy): $tfrecord_count TFRecord files"
     else
         echo "Couldn't find validated preprocessed data"
     fi

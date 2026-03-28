@@ -309,12 +309,14 @@ run_dascnn_training() {
     echo "Using TFRecord directory: $TFRecord_DIR"
     
     # Run DASCNN training
+    # Use window_size=512 (4s) for proper attention decoding (not 32 which is too short)
     python3 DASCNN.py \
         --tfrecord_dir "$TFRecord_DIR" \
         --batch_size 16 \
         --num_epochs 50 \
         --learning_rate 1e-4 \
-        --window_size 32 \
+        --window_size 512 \
+        --overlap 0.5 \
         --output_dir dascnn_results > dascnn_training.log 2>&1
     
     local exit_code=$?

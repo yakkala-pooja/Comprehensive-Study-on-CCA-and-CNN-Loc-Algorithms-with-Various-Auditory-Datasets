@@ -18,7 +18,9 @@
 # Features:
 # - Uses Fulsang preprocessing data (66 EEG channels)
 # - EEG + Audio envelope correlation (improved CCA performance)
-# - Optimal hyperparameters: cca_dims=12, regularization=0.08, window_size=1280 (20s)
+# - Aggressively optimized hyperparameters: cca_dims=20, regularization=0.08, window_size=1920 (30s)
+# - Optimized lag range: 150-400ms (speech tracking strongest range)
+# - Optimized filter band: 1-8 Hz (delta-theta, low frequencies dominate envelope tracking)
 # - Automatic audio file mapping and envelope extraction
 # - Comprehensive metrics evaluation
 
@@ -66,42 +68,51 @@ echo "=========================================="
 echo "Checking for Existing Fulsang Preprocessing"
 echo "=========================================="
 
-if [ ! -d "fulsang_preprocessed/tfrecords" ]; then
-    echo "⚠ Fulsang preprocessing not found!"
+# Check if TFRecord files exist (FULPRE.py format: fulsang_*.tfrecords)
+tfrecord_files=$(find fulsang_preprocessed/tfrecords -name "fulsang_*.tfrecords" 2>/dev/null | wc -l)
+
+if [ ! -d "fulsang_preprocessed/tfrecords" ] || [ "$tfrecord_files" -eq 0 ]; then
+    echo "⚠ Fulsang preprocessing not found or incomplete!"
     echo "  Expected directory: fulsang_preprocessed/tfrecords"
+    echo "  Expected files: fulsang_*.tfrecords (FULPRE.py format)"
     echo ""
-    echo "  Running preprocessing automatically..."
+    echo "  Running FULPRE.py automatically..."
     echo ""
     
-    # Check for DATA_preproc directory or zip file
-    DATA_PREPROC_PATH=""
-    if [ -d "Data/Fulsang/DATA_preproc" ]; then
-        DATA_PREPROC_PATH="Data/Fulsang/DATA_preproc"
-        echo "  Found DATA_preproc directory: $DATA_PREPROC_PATH"
-    elif [ -f "Data/Fulsang/DATA_preproc.zip" ]; then
-        DATA_PREPROC_PATH="Data/Fulsang/DATA_preproc.zip"
-        echo "  Found DATA_preproc.zip: $DATA_PREPROC_PATH"
-    elif [ -d "/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc" ]; then
-        DATA_PREPROC_PATH="/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc"
-        echo "  Found DATA_preproc directory: $DATA_PREPROC_PATH"
-    elif [ -f "/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc.zip" ]; then
-        DATA_PREPROC_PATH="/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc.zip"
-        echo "  Found DATA_preproc.zip: $DATA_PREPROC_PATH"
-    else
-        echo "  ✗ ERROR: Could not find DATA_preproc directory or zip file!"
-        echo "  Please ensure one of the following exists:"
-        echo "    - Data/Fulsang/DATA_preproc/"
-        echo "    - Data/Fulsang/DATA_preproc.zip"
-        echo "    - /home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc/"
-        echo "    - /home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc.zip"
+    # Check for Data/Fulsang directory
+    if [ ! -d "Data/Fulsang" ]; then
+        echo "  ✗ ERROR: Could not find Data/Fulsang directory!"
+        echo "  Please ensure the following exists:"
+        echo "    - Data/Fulsang/DATA_preproc/ (containing S*_data_preproc.mat files)"
         exit 1
     fi
     
-    # Run preprocessing
-    echo "  Running FULSANGPREPROCESSING.py..."
-    python FULSANGPREPROCESSING.py \
-        --data_path "$DATA_PREPROC_PATH" \
+    if [ ! -d "Data/Fulsang/DATA_preproc" ]; then
+        echo "  ✗ ERROR: Could not find Data/Fulsang/DATA_preproc directory!"
+        echo "  FULPRE.py requires MATLAB preprocessed files in Data/Fulsang/DATA_preproc/"
+        exit 1
+    fi
+    
+    echo "  Found Data/Fulsang/DATA_preproc directory"
+    echo "  Running FULPRE.py to create trial-level TFRecords..."
+    
+            # Run preprocessing using FULPRE.py
+            # Explicitly specify EEG directory if it exists
+            if [ -d "Data/Fulsang/EEG" ]; then
+                python FULPRE.py \
+                    --data_dir "Data/Fulsang" \
+                    --output_dir "fulsang_preprocessed" \
+                    --eeg_raw_dir "Data/Fulsang/EEG"
+            elif [ -f "Data/Fulsang/EEG.zip" ]; then
+                python FULPRE.py \
+                    --data_dir "Data/Fulsang" \
+                    --output_dir "fulsang_preprocessed" \
+                    --eeg_raw_dir "Data/Fulsang/EEG.zip"
+            else
+                python FULPRE.py \
+                    --data_dir "Data/Fulsang" \
         --output_dir "fulsang_preprocessed"
+            fi
     
     PREPROC_EXIT_CODE=$?
     
@@ -116,46 +127,62 @@ if [ ! -d "fulsang_preprocessed/tfrecords" ]; then
         exit 1
     fi
     
-    tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
+    # Check for FULPRE.py format files (fulsang_*.tfrecords)
+    tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "fulsang_*.tfrecords" 2>/dev/null | wc -l)
     if [ "$tfrecord_count" -eq 0 ]; then
-        echo "  ✗ ERROR: Preprocessing completed but no TFRecord files were created!"
+        echo "  ✗ ERROR: Preprocessing completed but no FULPRE.py format TFRecord files were created!"
+        echo "  Expected files: fulsang_*.tfrecords"
+        echo "  Found files:"
+        find fulsang_preprocessed/tfrecords -name "*.tfrecords" 2>/dev/null | head -5
         exit 1
     fi
     
     echo "  ✓ Preprocessing completed successfully!"
-    echo "  Created $tfrecord_count TFRecord file(s)"
+    echo "  Created $tfrecord_count FULPRE.py format TFRecord file(s)"
 else
     echo "✓ Fulsang preprocessing found"
     echo "  Using existing TFRecord files from: fulsang_preprocessed/tfrecords"
     
-    # Count TFRecord files
-    tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "*.tfrecords" 2>/dev/null | wc -l)
-    echo "  Found $tfrecord_count TFRecord file(s)"
+    # Count FULPRE.py format TFRecord files (fulsang_*.tfrecords)
+    tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "fulsang_*.tfrecords" 2>/dev/null | wc -l)
+    echo "  Found $tfrecord_count FULPRE.py format TFRecord file(s)"
     
     if [ "$tfrecord_count" -eq 0 ]; then
-        echo "  ⚠ WARNING: No TFRecord files found in the directory!"
-        echo "  Re-running preprocessing..."
+        echo "  ⚠ WARNING: No FULPRE.py format TFRecord files found!"
+        echo "  Expected files: fulsang_*.tfrecords"
+        echo "  Re-running FULPRE.py preprocessing..."
         
-        # Try to find and run preprocessing
-        DATA_PREPROC_PATH=""
-        if [ -d "Data/Fulsang/DATA_preproc" ]; then
-            DATA_PREPROC_PATH="Data/Fulsang/DATA_preproc"
-        elif [ -f "Data/Fulsang/DATA_preproc.zip" ]; then
-            DATA_PREPROC_PATH="Data/Fulsang/DATA_preproc.zip"
-        elif [ -d "/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc" ]; then
-            DATA_PREPROC_PATH="/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc"
-        elif [ -f "/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc.zip" ]; then
-            DATA_PREPROC_PATH="/home/py9363/telluride_decoding/Data/Fulsang/DATA_preproc.zip"
-        fi
-        
-        if [ -n "$DATA_PREPROC_PATH" ]; then
-            python FULSANGPREPROCESSING.py \
-                --data_path "$DATA_PREPROC_PATH" \
-                --output_dir "fulsang_preprocessed"
-        else
-            echo "  ✗ ERROR: Could not find DATA_preproc to re-run preprocessing"
+        # Check for Data/Fulsang directory
+        if [ ! -d "Data/Fulsang/DATA_preproc" ]; then
+            echo "  ✗ ERROR: Could not find Data/Fulsang/DATA_preproc directory to re-run preprocessing"
             exit 1
         fi
+        
+                echo "  Running FULPRE.py..."
+                # Explicitly specify EEG directory if it exists
+                if [ -d "Data/Fulsang/EEG" ]; then
+                    python FULPRE.py \
+                        --data_dir "Data/Fulsang" \
+                        --output_dir "fulsang_preprocessed" \
+                        --eeg_raw_dir "Data/Fulsang/EEG"
+                elif [ -f "Data/Fulsang/EEG.zip" ]; then
+                    python FULPRE.py \
+                        --data_dir "Data/Fulsang" \
+                        --output_dir "fulsang_preprocessed" \
+                        --eeg_raw_dir "Data/Fulsang/EEG.zip"
+                else
+                    python FULPRE.py \
+                        --data_dir "Data/Fulsang" \
+                --output_dir "fulsang_preprocessed"
+                fi
+        
+        # Verify again
+        tfrecord_count=$(find fulsang_preprocessed/tfrecords -name "fulsang_*.tfrecords" 2>/dev/null | wc -l)
+        if [ "$tfrecord_count" -eq 0 ]; then
+            echo "  ✗ ERROR: Preprocessing failed - no TFRecord files created"
+            exit 1
+        fi
+        echo "  ✓ Created $tfrecord_count TFRecord file(s)"
     fi
 fi
 
@@ -164,14 +191,22 @@ echo "=========================================="
 echo "Running FULCCA Analysis"
 echo "=========================================="
 
-# Configuration: Optimal Fulsang settings (from Optimal_FULCCA.py)
-echo "Running Optimal Fulsang CCA Configuration..."
+# Configuration: AGGRESSIVELY OPTIMIZED Fulsang settings
+# - Increased CCA dimensions: 12 → 20 (max 30)
+# - Optimized lag range: 150-400ms (strongest speech tracking range)
+# - Optimized filter band: 1-8 Hz (delta-theta, low frequencies dominate)
+# - Window size: 1920 (30s, best from temporal analysis)
+echo "Running Aggressively Optimized Fulsang CCA Configuration..."
 python FULCCA.py \
     --tfrecord_dir fulsang_preprocessed/tfrecords \
     --batch_size 6 \
-    --cca_dims 12 \
+    --cca_dims 25 \
     --regularization 0.08 \
-    --window_size 1280 \
+    --window_size 1920 \
+    --min_lag_ms 150.0 \
+    --max_lag_ms 400.0 \
+    --eeg_low_freq 1.0 \
+    --eeg_high_freq 8.0 \
     --output_dir fulcca_results/optimal_fulcca \
     --load_audio \
     --max_files 100

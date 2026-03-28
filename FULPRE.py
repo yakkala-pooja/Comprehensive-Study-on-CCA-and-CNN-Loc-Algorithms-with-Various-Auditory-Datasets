@@ -9,9 +9,24 @@ The script:
 1. Loads preprocessed MATLAB files from Data/Fulsang/DATA_preproc/
 2. Extracts EEG data (66 channels, 60 trials, 3200 samples per trial)
 3. Extracts audio envelopes (wavA and wavB)
-4. Extracts attention labels from event structure (attend_mf: 1=male, 2=female)
+4. Extracts attention labels from event.eeg.value{1} (TRUE LABELS embedded during preprocessing)
 5. Creates TFRecord files for training
 6. Handles all 18 subjects (S1-S18)
+
+CRITICAL NOTE ON LABELS:
+- Labels are embedded in the preprocessed files via the MATLAB preprocessing pipeline
+- During preprocessing (preproc_data.m), expinfo.attend_mf (1=male, 2=female) is written into data.event.eeg.value
+- After splitting into trials, each trial has: data{ii}.event.eeg.value{1} = label (TRUE LABELS)
+- This script extracts labels from event.eeg.value{1} for each trial - these are the TRUE labels
+- Fallback priority: 1) Raw EEG files (if available), 2) expinfo.attend_mf in DATA_preproc, 3) event.eeg.value{1}
+- The script auto-detects EEG.zip or EEG/ directory in Data/Fulsang/ for raw file access
+
+IMPORTANT: MATLAB TABLE COMPATIBILITY:
+- Raw EEG files store expinfo as MATLAB tables (MCOS objects)
+- SciPy cannot read MATLAB tables directly (expinfo will be None)
+- SOLUTION: Run convert_expinfo_tables.m in MATLAB once to convert tables to structs
+- The script will automatically detect and use converted *_expinfo_struct.mat files
+- This is a one-time conversion step - run it once, then FULPRE.py will use the converted files
 
 Experimental information (expinfo):
 - attend_mf: attended speaker (1=male, 2=female)
@@ -33,6 +48,9 @@ from tqdm import tqdm
 import json
 from datetime import datetime
 import warnings
+import zipfile
+import tempfile
+import shutil
 warnings.filterwarnings('ignore')
 
 
@@ -52,7 +70,8 @@ class FulsangPreprocessor:
                  n_channels: int = 66,
                  trial_length: int = 3200,
                  filter_n_speakers: int = 2,
-                 require_audio: bool = False):
+                 require_audio: bool = False,
+                 eeg_raw_dir: Optional[str] = None):
         """
         Initialize the preprocessor.
         
@@ -64,11 +83,50 @@ class FulsangPreprocessor:
             trial_length: Number of samples per trial (3200 = 50 seconds at 64 Hz)
             filter_n_speakers: Only include trials with this many speakers (default: 2 for AAD)
             require_audio: If True, fail if audio extraction fails. If False, skip audio fields when missing.
+            eeg_raw_dir: Path to raw EEG files (EEG.zip or EEG/ directory). If None, tries to auto-detect.
         """
         self.data_dir = Path(data_dir)
         self.preproc_dir = self.data_dir / "DATA_preproc"
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        
+        # Set up raw EEG directory (for extracting true attention labels)
+        if eeg_raw_dir is None:
+            # Auto-detect: try EEG.zip first, then EEG/ directory
+            eeg_zip = self.data_dir / "EEG.zip"
+            eeg_dir = self.data_dir / "EEG"
+            if eeg_zip.exists():
+                self.eeg_raw_path = eeg_zip
+                self.eeg_raw_is_zip = True
+                print(f"    ✓ Found raw EEG files: {eeg_zip}")
+            elif eeg_dir.exists():
+                self.eeg_raw_path = eeg_dir
+                self.eeg_raw_is_zip = False
+                print(f"    ✓ Found raw EEG directory: {eeg_dir}")
+            else:
+                self.eeg_raw_path = None
+                self.eeg_raw_is_zip = False
+                print(f"    ⚠ WARNING: Raw EEG files not found!")
+                print(f"    ⚠ Checked locations:")
+                print(f"      - {eeg_zip} (does not exist)")
+                print(f"      - {eeg_dir} (does not exist)")
+                print(f"    ⚠ Will fall back to labels from DATA_preproc (may be trigger codes)")
+                print(f"    ⚠ This will result in ~50% accuracy if trigger codes don't encode attention")
+        else:
+            eeg_raw_path = Path(eeg_raw_dir)
+            if eeg_raw_path.is_file() and eeg_raw_path.suffix == '.zip':
+                self.eeg_raw_path = eeg_raw_path
+                self.eeg_raw_is_zip = True
+            elif eeg_raw_path.is_dir():
+                self.eeg_raw_path = eeg_raw_path
+                self.eeg_raw_is_zip = False
+            else:
+                self.eeg_raw_path = None
+                self.eeg_raw_is_zip = False
+                print(f"    ⚠ WARNING: Raw EEG path not found: {eeg_raw_path}")
+        
+        # Cache for extracted labels (subject_id -> labels array)
+        self._raw_labels_cache: Dict[int, Optional[np.ndarray]] = {}
         
         # Create TFRecord output directory
         self.tfrecord_dir = self.output_dir / "tfrecords"
@@ -121,6 +179,32 @@ class FulsangPreprocessor:
         
         print(f"Found {len(mat_files)} MATLAB files to process")
         print(f"Output directory: {self.tfrecord_dir}")
+        print("="*70)
+        if self.eeg_raw_path is None:
+            print("⚠⚠⚠ CRITICAL WARNING: Raw EEG files not found! ⚠⚠⚠")
+            print("")
+            print("  Labels will be extracted from trigger codes (DATA_preproc files)")
+            print("  This will result in ~50% accuracy (chance level) because trigger codes")
+            print("  do NOT encode attention direction - they encode experimental markers.")
+            print("")
+            print("  To get TRUE attention labels (expinfo.attend_mf) and achieve 65-75% accuracy:")
+            print("  1. Ensure raw EEG files are available in one of these locations:")
+            print("     - Data/Fulsang/EEG.zip (ZIP file containing S*.mat files)")
+            print("     - Data/Fulsang/EEG/ (directory containing S*.mat files)")
+            print("")
+            print("  2. Raw EEG files contain expinfo.attend_mf which correctly encodes")
+            print("     attended speaker (1=male, 2=female)")
+            print("")
+            print("  Current checked locations:")
+            eeg_zip = self.data_dir / "EEG.zip"
+            eeg_dir = self.data_dir / "EEG"
+            print(f"    - {eeg_zip} ({'EXISTS' if eeg_zip.exists() else 'NOT FOUND'})")
+            print(f"    - {eeg_dir} ({'EXISTS' if eeg_dir.exists() else 'NOT FOUND'})")
+            print("")
+            print("="*70)
+        else:
+            print(f"✓ Raw EEG files configured: {self.eeg_raw_path}")
+            print("  Will extract true attention labels (expinfo.attend_mf) from raw EEG files")
         print("="*70)
         
         # Process each subject
@@ -204,9 +288,24 @@ class FulsangPreprocessor:
                     wavB_trials = [None] * len(eeg_trials)
             
             # Extract trial-level attention labels (no expansion to sample level)
-            attention_labels = self._extract_attention_labels(data_struct, expinfo, len(eeg_trials))
+            # CRITICAL: This tries raw EEG files first, then DATA_preproc expinfo.attend_mf, then trigger codes
+            # Raw EEG files contain true attention labels (expinfo.attend_mf)
+            subject_id_str = self._extract_subject_id(mat_file)
+            # Convert "S1" -> 1, "S18" -> 18
+            try:
+                subject_id_int = int(subject_id_str.replace('S', '').replace('s', ''))
+            except:
+                subject_id_int = None
+            attention_labels = self._extract_attention_labels(data_struct, expinfo, len(eeg_trials), subject_id=subject_id_int)
             if attention_labels is None:
                 raise RuntimeError(f"Failed to extract attention labels from {mat_file.name}")
+            
+            # Diagnostic: Check if labels came from attend_mf or trigger codes
+            label_source = expinfo.get('label_source', 'unknown')
+            if label_source == 'event.trigger':
+                print(f"    ⚠ WARNING: Labels extracted from trigger codes, not expinfo.attend_mf")
+                print(f"    ⚠ This may cause ~50% accuracy if trigger codes don't encode attention direction")
+                print(f"    ⚠ For accurate decoding, extract labels from raw EEG.zip files (expinfo.attend_mf)")
             
             # Validate per-trial consistency
             n_trials = len(eeg_trials)
@@ -230,7 +329,7 @@ class FulsangPreprocessor:
                 """Extract value from expinfo field for given trial index."""
                 value = expinfo.get(field_name)
                 if value is None:
-                    return None
+                return None
                 if isinstance(value, (list, np.ndarray)):
                     if trial_idx < len(value):
                         return value[trial_idx]
@@ -274,9 +373,29 @@ class FulsangPreprocessor:
                 'audio_mismatch': 0
             }
             
+            # Check if n_speakers is available for filtering
+            n_speakers_available = expinfo.get('n_speakers') is not None
+            n_speakers_filter_applied = False
+            
             for trial_idx in range(n_trials):
-                # Note: n_speakers filtering is disabled since n_speakers is unavailable
-                # If n_speakers becomes available in the future, filtering can be re-enabled
+                # Apply n_speakers filtering if available
+                if n_speakers_available:
+                    n_speakers_val = get_expinfo_scalar('n_speakers', trial_idx)
+                    if n_speakers_val is not None:
+                        n_speakers_scalar = to_scalar(n_speakers_val)
+                        if n_speakers_scalar is not None:
+                            try:
+                                n_speakers_int = int(n_speakers_scalar)
+                                if n_speakers_int != self.filter_n_speakers:
+                                    filtered_reasons['n_speakers_mismatch'] += 1
+                                    continue
+                                n_speakers_filter_applied = True
+                            except (ValueError, TypeError):
+                                filtered_reasons['n_speakers_invalid'] += 1
+                                continue
+                    else:
+                        filtered_reasons['n_speakers_missing'] += 1
+                        continue
                 
                 # Trust attention_labels[trial_idx] - already validated in _extract_attention_labels()
                 # Labels may come from expinfo.attend_mf or event structure (trigger codes)
@@ -311,6 +430,8 @@ class FulsangPreprocessor:
             
             print(f"  Extracted {n_trials} trials, {len(valid_trials)} valid after filtering")
             print(f"    Filter reasons: {filtered_reasons}")
+            if not n_speakers_filter_applied:
+                print(f"    [NOTE] n_speakers filtering not applied (n_speakers unavailable in expinfo)")
             print(f"    Label distribution: {dict(enumerate(np.bincount([attention_labels[i] for i in valid_trials], minlength=2)))}")
             
             # Create TFRecord file
@@ -326,7 +447,8 @@ class FulsangPreprocessor:
             # Write manifest JSON with filtering information
             manifest_file = self.tfrecord_dir / f"fulsang_{subject_id}_manifest.json"
             self._write_manifest(manifest_file, subject_id, n_trials, valid_trials, 
-                               attention_labels, expinfo, filtered_reasons)
+                               attention_labels, expinfo, filtered_reasons,
+                               n_speakers_filter_applied, n_speakers_available)
             
             return {
                 'subject_id': subject_id,
@@ -542,7 +664,7 @@ class FulsangPreprocessor:
                             # Has correct number of channels in second dimension
                             # Assume first dimension is time (might be shorter than trial_length)
                             if trial_data.shape[0] < self.trial_length:
-                                # Pad with zeros
+                        # Pad with zeros
                                 padding = np.zeros((self.trial_length - trial_data.shape[0], self.n_channels), dtype=np.float32)
                                 trial_data = np.concatenate([trial_data, padding], axis=0)
                             elif trial_data.shape[0] > self.trial_length:
@@ -556,14 +678,14 @@ class FulsangPreprocessor:
                                 trial_data = np.concatenate([trial_data, padding], axis=0)
                             elif trial_data.shape[0] > self.trial_length:
                                 trial_data = trial_data[:self.trial_length, :]
-                        else:
+                    else:
                             # Try to fix by ensuring correct number of channels
                             if trial_data.shape[1] < self.n_channels:
                                 # Pad with zeros
                                 padding = np.zeros((trial_data.shape[0], self.n_channels - trial_data.shape[1]), dtype=np.float32)
                                 trial_data = np.concatenate([trial_data.astype(np.float32), padding], axis=1)
                             elif trial_data.shape[1] > self.n_channels:
-                                # Truncate
+                        # Truncate
                                 trial_data = trial_data[:, :self.n_channels]
                         
                         # Final validation
@@ -623,46 +745,42 @@ class FulsangPreprocessor:
             elif hasattr(first_elem, 'dtype') and hasattr(first_elem.dtype, 'names') and 'wavA' in first_elem.dtype.names:
                 wavA_field = first_elem['wavA']
             
-            if wavA_field is not None:
-                if isinstance(wavA_field, np.ndarray):
-                    if wavA_field.dtype == object:
-                        # Cell array (object dtype) - extract each trial
-                        if wavA_field.size > 0:
-                            all_trials = []
-                            for i in range(wavA_field.size):
-                                trial_data = wavA_field.flat[i]
-                                if isinstance(trial_data, np.ndarray):
-                                    if trial_data.ndim == 1:
-                                        trial_data = trial_data.reshape(-1, 1)
-                                    elif trial_data.ndim > 2:
-                                        trial_data = trial_data.reshape(trial_data.shape[0], -1)
-                                        # Ensure single feature
-                                        if trial_data.shape[1] > 1:
-                                            trial_data = trial_data[:, 0:1]
-                                    all_trials.append(trial_data.astype(np.float32))
-                            
-                            if all_trials:
-                                wavA_trials = all_trials
-                    else:
-                        # Numeric array - reshape to extract trials
-                        # Common shapes: (trial_length, n_trials) or (trial_length, 1, n_trials)
-                        if wavA_field.ndim == 2:
-                            # Shape: (trial_length, n_trials)
-                            if wavA_field.shape[0] == self.trial_length:
-                                n_trials = wavA_field.shape[1]
-                                wavA_trials = [wavA_field[:, i:i+1].astype(np.float32) for i in range(n_trials)]
-                            elif wavA_field.shape[1] == self.trial_length:
-                                # Transposed: (n_trials, trial_length)
-                                n_trials = wavA_field.shape[0]
-                                wavA_trials = [wavA_field[i:i+1, :].T.astype(np.float32) for i in range(n_trials)]
-                        elif wavA_field.ndim == 3:
-                            # Shape: (trial_length, 1, n_trials) or similar
-                            if wavA_field.shape[0] == self.trial_length:
-                                n_trials = wavA_field.shape[2]
-                                wavA_trials = [wavA_field[:, 0, i:i+1].astype(np.float32) for i in range(n_trials)]
-                            elif wavA_field.shape[2] == self.trial_length:
-                                n_trials = wavA_field.shape[0]
-                                wavA_trials = [wavA_field[i, 0, :].reshape(-1, 1).astype(np.float32) for i in range(n_trials)]
+            if wavA_field is not None and isinstance(wavA_field, np.ndarray) and wavA_field.size > 0:
+                if wavA_field.dtype == object:
+                    # Cell array (object dtype) - extract each trial
+                    all_trials = []
+                    for i in range(wavA_field.size):
+                        trial_data = wavA_field.flat[i]
+                        if isinstance(trial_data, np.ndarray):
+                            if trial_data.ndim == 1:
+                                trial_data = trial_data.reshape(-1, 1)
+                            elif trial_data.ndim > 2:
+                                trial_data = trial_data.reshape(trial_data.shape[0], -1)
+                            if trial_data.ndim >= 1 and trial_data.size > 0:
+                                if trial_data.ndim == 1:
+                                    trial_data = trial_data.reshape(-1, 1)
+                                elif trial_data.shape[1] > 1:
+                                    trial_data = trial_data[:, 0:1]
+                                all_trials.append(trial_data.astype(np.float32))
+                    if all_trials:
+                        wavA_trials = all_trials
+                else:
+                    # Numeric array - reshape to extract trials
+                    # Common shapes: (trial_length, n_trials) or (trial_length, 1, n_trials)
+                    if wavA_field.ndim == 2:
+                        if wavA_field.shape[0] == self.trial_length:
+                            n_trials = wavA_field.shape[1]
+                            wavA_trials = [wavA_field[:, i:i+1].astype(np.float32) for i in range(n_trials)]
+                        elif wavA_field.shape[1] == self.trial_length:
+                            n_trials = wavA_field.shape[0]
+                            wavA_trials = [wavA_field[i:i+1, :].T.astype(np.float32) for i in range(n_trials)]
+                    elif wavA_field.ndim == 3:
+                        if wavA_field.shape[0] == self.trial_length:
+                            n_trials = wavA_field.shape[2]
+                            wavA_trials = [wavA_field[:, 0, i:i+1].astype(np.float32) for i in range(n_trials)]
+                        elif wavA_field.shape[2] == self.trial_length:
+                            n_trials = wavA_field.shape[0]
+                            wavA_trials = [wavA_field[i, 0, :].reshape(-1, 1).astype(np.float32) for i in range(n_trials)]
             
             # Extract wavB - handle both mat_struct and structured array
             wavB_field = None
@@ -671,42 +789,41 @@ class FulsangPreprocessor:
             elif hasattr(first_elem, 'dtype') and hasattr(first_elem.dtype, 'names') and 'wavB' in first_elem.dtype.names:
                 wavB_field = first_elem['wavB']
             
-            if wavB_field is not None:
-                if isinstance(wavB_field, np.ndarray):
-                    if wavB_field.dtype == object:
-                        # Cell array (object dtype) - extract each trial
-                        if wavB_field.size > 0:
-                            all_trials = []
-                            for i in range(wavB_field.size):
-                                trial_data = wavB_field.flat[i]
-                                if isinstance(trial_data, np.ndarray):
-                                    if trial_data.ndim == 1:
-                                        trial_data = trial_data.reshape(-1, 1)
-                                    elif trial_data.ndim > 2:
-                                        trial_data = trial_data.reshape(trial_data.shape[0], -1)
-                                        # Ensure single feature
-                                        if trial_data.shape[1] > 1:
-                                            trial_data = trial_data[:, 0:1]
-                                    all_trials.append(trial_data.astype(np.float32))
-                            
-                            if all_trials:
-                                wavB_trials = all_trials
-                    else:
-                        # Numeric array - reshape to extract trials
-                        if wavB_field.ndim == 2:
-                            if wavB_field.shape[0] == self.trial_length:
-                                n_trials = wavB_field.shape[1]
-                                wavB_trials = [wavB_field[:, i:i+1].astype(np.float32) for i in range(n_trials)]
-                            elif wavB_field.shape[1] == self.trial_length:
-                                n_trials = wavB_field.shape[0]
-                                wavB_trials = [wavB_field[i:i+1, :].T.astype(np.float32) for i in range(n_trials)]
-                        elif wavB_field.ndim == 3:
-                            if wavB_field.shape[0] == self.trial_length:
-                                n_trials = wavB_field.shape[2]
-                                wavB_trials = [wavB_field[:, 0, i:i+1].astype(np.float32) for i in range(n_trials)]
-                            elif wavB_field.shape[2] == self.trial_length:
-                                n_trials = wavB_field.shape[0]
-                                wavB_trials = [wavB_field[i, 0, :].reshape(-1, 1).astype(np.float32) for i in range(n_trials)]
+            if wavB_field is not None and isinstance(wavB_field, np.ndarray) and wavB_field.size > 0:
+                if wavB_field.dtype == object:
+                    # Cell array (object dtype) - extract each trial
+                    all_trials = []
+                    for i in range(wavB_field.size):
+                        trial_data = wavB_field.flat[i]
+                        if isinstance(trial_data, np.ndarray):
+                            if trial_data.ndim == 1:
+                                trial_data = trial_data.reshape(-1, 1)
+                            elif trial_data.ndim > 2:
+                                trial_data = trial_data.reshape(trial_data.shape[0], -1)
+                            if trial_data.ndim >= 1 and trial_data.size > 0:
+                                if trial_data.ndim == 1:
+                                    trial_data = trial_data.reshape(-1, 1)
+                                elif trial_data.shape[1] > 1:
+                                    trial_data = trial_data[:, 0:1]
+                                all_trials.append(trial_data.astype(np.float32))
+                    if all_trials:
+                        wavB_trials = all_trials
+                else:
+                    # Numeric array - reshape to extract trials
+                    if wavB_field.ndim == 2:
+                        if wavB_field.shape[0] == self.trial_length:
+                            n_trials = wavB_field.shape[1]
+                            wavB_trials = [wavB_field[:, i:i+1].astype(np.float32) for i in range(n_trials)]
+                        elif wavB_field.shape[1] == self.trial_length:
+                            n_trials = wavB_field.shape[0]
+                            wavB_trials = [wavB_field[i:i+1, :].T.astype(np.float32) for i in range(n_trials)]
+                    elif wavB_field.ndim == 3:
+                        if wavB_field.shape[0] == self.trial_length:
+                            n_trials = wavB_field.shape[2]
+                            wavB_trials = [wavB_field[:, 0, i:i+1].astype(np.float32) for i in range(n_trials)]
+                        elif wavB_field.shape[2] == self.trial_length:
+                            n_trials = wavB_field.shape[0]
+                            wavB_trials = [wavB_field[i, 0, :].reshape(-1, 1).astype(np.float32) for i in range(n_trials)]
             
             return wavA_trials, wavB_trials
             
@@ -714,14 +831,326 @@ class FulsangPreprocessor:
             print(f"    Error extracting audio trials: {e}")
             return None, None
     
-    def _extract_attention_labels(self, data_struct, expinfo: Dict, n_trials: int) -> Optional[np.ndarray]:
+    def _load_labels_from_raw_eeg(self, subject_id: int) -> Optional[np.ndarray]:
         """
-        Extract attention labels from expinfo structure.
+        Load attention labels (expinfo.attend_mf) from raw EEG files.
         
-        Based on MATLAB script: events_of_interest = expinfo.attend_mf
-        where 1 = male, 2 = female
+        This is the PRIMARY source of true attention labels. Raw EEG.zip files contain
+        expinfo.attend_mf which correctly encodes attended speaker (1=male, 2=female).
+        
+        Args:
+            subject_id: Subject ID (1-18)
+            
+        Returns:
+            Array of trial-level labels (0=male, 1=female) or None if not available
+        """
+        # Check cache first
+        if subject_id in self._raw_labels_cache:
+            return self._raw_labels_cache[subject_id]
+        
+        # If no raw EEG path configured, return None
+        if self.eeg_raw_path is None:
+            self._raw_labels_cache[subject_id] = None
+            return None
+        
+        # PRIORITY 1: Check for converted expinfo_struct.mat file (from MATLAB conversion script)
+        # This is the cleanest solution - MATLAB converts table to struct, Python reads it
+        # Check in the same directory as the raw EEG files
+        if self.eeg_raw_is_zip:
+            # For ZIP files, check in the same directory as the ZIP file
+            zip_dir = self.eeg_raw_path.parent
+            converted_file = zip_dir / f"S{subject_id}_expinfo_struct.mat"
+            # Also check in a potential EEG subdirectory
+            if not converted_file.exists():
+                converted_file = zip_dir / "EEG" / f"S{subject_id}_expinfo_struct.mat"
+        else:
+            # For directory, check in the same directory as the raw EEG files
+            converted_file = self.eeg_raw_path / f"S{subject_id}_expinfo_struct.mat"
+        
+        # Diagnostic: Show where we're looking (only once per subject)
+        if subject_id not in self._raw_labels_cache:
+            if not converted_file.exists():
+                print(f"    [INFO] Converted expinfo file not found: {converted_file.name}")
+                print(f"    [INFO] Expected location: {converted_file}")
+                print(f"    [INFO] To create converted files, run convert_expinfo_tables.m in MATLAB")
+                print(f"    [INFO] Falling back to original raw EEG file (may fail if expinfo is a MATLAB table)")
+        
+        if converted_file.exists():
+            try:
+                if subject_id not in self._raw_labels_cache:
+                    print(f"    [INFO] Found converted expinfo file: {converted_file.name}")
+                mat_data = sio.loadmat(str(converted_file), squeeze_me=True, struct_as_record=False)
+                
+                # Extract expinfo_struct
+                expinfo_struct = mat_data.get('expinfo_struct')
+                if expinfo_struct is None:
+                    if subject_id not in self._raw_labels_cache:
+                        print(f"    ⚠ Converted file missing 'expinfo_struct' key")
+                    self._raw_labels_cache[subject_id] = None
+                    return None
+                
+                # Extract attend_mf
+                attend_mf = None
+                if isinstance(expinfo_struct, dict):
+                    attend_mf = expinfo_struct.get('attend_mf')
+                elif hasattr(expinfo_struct, 'attend_mf'):
+                    attend_mf = expinfo_struct.attend_mf
+                elif hasattr(expinfo_struct, 'dtype') and hasattr(expinfo_struct.dtype, 'names') and 'attend_mf' in expinfo_struct.dtype.names:
+                    attend_mf = expinfo_struct['attend_mf']
+                
+                if attend_mf is None:
+                    if subject_id not in self._raw_labels_cache:
+                        print(f"    ⚠ attend_mf not found in converted expinfo_struct")
+                        if isinstance(expinfo_struct, dict):
+                            print(f"    ⚠ Available keys: {list(expinfo_struct.keys())[:10]}")
+                    self._raw_labels_cache[subject_id] = None
+                    return None
+                
+                # Convert to array
+                if isinstance(attend_mf, np.ndarray):
+                    attend_mf_list = attend_mf.flatten().tolist()
+                elif isinstance(attend_mf, (list, tuple)):
+                    attend_mf_list = list(attend_mf)
+                else:
+                    attend_mf_list = [attend_mf]
+                
+                # Convert 1=male->0, 2=female->1
+                labels = np.array([0 if v == 1 else 1 for v in attend_mf_list], dtype=np.int64)
+                
+                # Validate
+                unique_vals = set(attend_mf_list)
+                if not unique_vals.issubset({1, 2}):
+                    if subject_id not in self._raw_labels_cache:
+                        print(f"    ⚠ Invalid attend_mf values in converted file: {unique_vals}")
+                    self._raw_labels_cache[subject_id] = None
+                    return None
+                
+                print(f"    ✓ Loaded {len(labels)} labels from converted expinfo file (expinfo.attend_mf)")
+                self._raw_labels_cache[subject_id] = labels
+                return labels
+                
+            except Exception as e:
+                if subject_id not in self._raw_labels_cache:
+                    print(f"    ⚠ Error loading converted expinfo file: {e}")
+                # Fall through to try original file
+        
+        # PRIORITY 2: Try to load from original raw EEG file
+        # Note: This will likely fail if expinfo is a MATLAB table (MCOS object)
+        # The converted file approach (above) is the recommended solution
+        
+        try:
+            # Try to load from raw EEG file
+            if self.eeg_raw_is_zip:
+                # Extract from ZIP file
+                with zipfile.ZipFile(self.eeg_raw_path, 'r') as zip_ref:
+                    # Look for S{subject_id}.mat in the ZIP
+                    mat_filename = f"S{subject_id}.mat"
+                    if mat_filename not in zip_ref.namelist():
+                        # Try alternative naming
+                        possible_names = [
+                            f"EEG/S{subject_id}.mat",
+                            f"S{subject_id}/S{subject_id}.mat",
+                            f"eeg/S{subject_id}.mat",
+                        ]
+                        mat_filename = None
+                        for name in possible_names:
+                            if name in zip_ref.namelist():
+                                mat_filename = name
+                                break
+                        
+                        if mat_filename is None:
+                            # List available files for debugging
+                            available = [n for n in zip_ref.namelist() if f"S{subject_id}" in n or f"s{subject_id}" in n]
+                            if available:
+                                print(f"    ⚠ Raw EEG: Found files for S{subject_id} but not S{subject_id}.mat: {available[:3]}")
+                            self._raw_labels_cache[subject_id] = None
+                            return None
+                    
+                    # Extract to temporary directory and load
+                    with tempfile.TemporaryDirectory() as tmp_dir:
+                        tmp_dir_path = Path(tmp_dir)
+                        zip_ref.extract(mat_filename, tmp_dir_path)
+                        extracted_path = tmp_dir_path / Path(mat_filename).name
+                        
+                        if not extracted_path.exists():
+                            # Handle nested paths in ZIP
+                            extracted_path = tmp_dir_path / mat_filename
+                        
+                        if not extracted_path.exists():
+                            self._raw_labels_cache[subject_id] = None
+                            return None
+                        
+                        # Load MATLAB file
+                        mat_data = sio.loadmat(str(extracted_path), squeeze_me=False, struct_as_record=False)
+                        
+                        # Extract expinfo
+                        expinfo = mat_data.get('expinfo')
+                        if expinfo is None:
+                            # Try alternative names
+                            for info_name in ['exp_info', 'experiment_info', 'info']:
+                                if info_name in mat_data:
+                                    expinfo = mat_data[info_name]
+                                    break
+                        
+                        if expinfo is None:
+                            if subject_id not in self._raw_labels_cache:
+                                print(f"    ⚠ Raw EEG: expinfo not found in {mat_filename} (ZIP)")
+                                print(f"    ⚠ This is expected - expinfo is a MATLAB table (MCOS object)")
+                                print(f"    ⚠ SciPy cannot read MATLAB tables. Use convert_expinfo_tables.m to convert.")
+                                print(f"    ⚠ Available keys: {[k for k in mat_data.keys() if not k.startswith('__')][:10]}")
+                            self._raw_labels_cache[subject_id] = None
+                            return None
+                        
+                        # Extract attend_mf from expinfo
+                        attend_mf = None
+                        if isinstance(expinfo, dict):
+                            attend_mf = expinfo.get('attend_mf')
+                        elif hasattr(expinfo, 'attend_mf'):
+                            attend_mf = expinfo.attend_mf
+                        
+                        if attend_mf is None:
+                            if subject_id not in self._raw_labels_cache:
+                                print(f"    ⚠ Raw EEG: attend_mf not found in expinfo for {mat_filename} (ZIP)")
+                                if isinstance(expinfo, dict):
+                                    print(f"    ⚠ Available expinfo keys: {list(expinfo.keys())[:10]}")
+                                elif hasattr(expinfo, '__dict__'):
+                                    print(f"    ⚠ Available expinfo attributes: {[k for k in dir(expinfo) if not k.startswith('_')][:10]}")
+                            self._raw_labels_cache[subject_id] = None
+                            return None
+                        
+                        # Convert to array
+                        if isinstance(attend_mf, np.ndarray):
+                            attend_mf_list = attend_mf.flatten().tolist()
+                        elif isinstance(attend_mf, (list, tuple)):
+                            attend_mf_list = list(attend_mf)
+                        else:
+                            attend_mf_list = [attend_mf]
+                        
+                        # Convert 1=male->0, 2=female->1
+                        labels = np.array([0 if v == 1 else 1 for v in attend_mf_list], dtype=np.int64)
+                        
+                        # Validate
+                        unique_vals = set(attend_mf_list)
+                        if not unique_vals.issubset({1, 2}):
+                            print(f"    ⚠ Raw EEG: Invalid attend_mf values: {unique_vals}")
+                            self._raw_labels_cache[subject_id] = None
+                            return None
+                        
+                        print(f"    ✓ Loaded {len(labels)} labels from raw EEG (expinfo.attend_mf)")
+                        self._raw_labels_cache[subject_id] = labels
+                        return labels
+            else:
+                # Load from directory
+                eeg_file = self.eeg_raw_path / f"S{subject_id}.mat"
+                if not eeg_file.exists():
+                    # Try alternative naming
+                    possible_paths = [
+                        self.eeg_raw_path / f"EEG" / f"S{subject_id}.mat",
+                        self.eeg_raw_path / f"eeg" / f"S{subject_id}.mat",
+                    ]
+                    eeg_file = None
+                    for path in possible_paths:
+                        if path.exists():
+                            eeg_file = path
+                            break
+                    
+                    if eeg_file is None:
+                        if subject_id not in self._raw_labels_cache:
+                            print(f"    ⚠ Raw EEG: File not found for S{subject_id}")
+                            print(f"    ⚠ Checked: {self.eeg_raw_path / f'S{subject_id}.mat'}")
+                            print(f"    ⚠ And alternative paths (none found)")
+                        self._raw_labels_cache[subject_id] = None
+                        return None
+                
+                # Load MATLAB file
+                try:
+                    mat_data = sio.loadmat(str(eeg_file), squeeze_me=False, struct_as_record=False)
+                except Exception as e:
+                    if subject_id not in self._raw_labels_cache:
+                        print(f"    ⚠ Raw EEG: Error loading {eeg_file.name}: {e}")
+                    self._raw_labels_cache[subject_id] = None
+                    return None
+                
+                # Extract expinfo
+                expinfo = mat_data.get('expinfo')
+                if expinfo is None:
+                    for info_name in ['exp_info', 'experiment_info', 'info']:
+                        if info_name in mat_data:
+                            expinfo = mat_data[info_name]
+                            break
+                
+                if expinfo is None:
+                    if subject_id not in self._raw_labels_cache:
+                        print(f"    ⚠ Raw EEG: expinfo not found in {eeg_file.name}")
+                        print(f"    ⚠ This is expected - expinfo is a MATLAB table (MCOS object)")
+                        print(f"    ⚠ SciPy cannot read MATLAB tables. Use convert_expinfo_tables.m to convert.")
+                        print(f"    ⚠ Available keys: {[k for k in mat_data.keys() if not k.startswith('__')][:10]}")
+                    self._raw_labels_cache[subject_id] = None
+                    return None
+                
+                # Extract attend_mf
+                attend_mf = None
+                if isinstance(expinfo, dict):
+                    attend_mf = expinfo.get('attend_mf')
+                elif hasattr(expinfo, 'attend_mf'):
+                    attend_mf = expinfo.attend_mf
+                
+                if attend_mf is None:
+                    if subject_id not in self._raw_labels_cache:
+                        print(f"    ⚠ Raw EEG: attend_mf not found in expinfo for {eeg_file.name}")
+                        if isinstance(expinfo, dict):
+                            print(f"    ⚠ Available expinfo keys: {list(expinfo.keys())[:10]}")
+                        elif hasattr(expinfo, '__dict__'):
+                            print(f"    ⚠ Available expinfo attributes: {[k for k in dir(expinfo) if not k.startswith('_')][:10]}")
+                    self._raw_labels_cache[subject_id] = None
+                    return None
+                
+                # Convert to array
+                if isinstance(attend_mf, np.ndarray):
+                    attend_mf_list = attend_mf.flatten().tolist()
+                elif isinstance(attend_mf, (list, tuple)):
+                    attend_mf_list = list(attend_mf)
+                else:
+                    attend_mf_list = [attend_mf]
+                
+                # Convert 1=male->0, 2=female->1
+                labels = np.array([0 if v == 1 else 1 for v in attend_mf_list], dtype=np.int64)
+                
+                # Validate
+                unique_vals = set(attend_mf_list)
+                if not unique_vals.issubset({1, 2}):
+                    print(f"    ⚠ Raw EEG: Invalid attend_mf values: {unique_vals}")
+                    self._raw_labels_cache[subject_id] = None
+                    return None
+                
+                print(f"    ✓ Loaded {len(labels)} labels from raw EEG (expinfo.attend_mf)")
+                self._raw_labels_cache[subject_id] = labels
+                return labels
+                
+        except Exception as e:
+            print(f"    ⚠ Error loading labels from raw EEG for S{subject_id}: {e}")
+            self._raw_labels_cache[subject_id] = None
+            return None
+    
+    def _extract_attention_labels(self, data_struct, expinfo: Dict, n_trials: int, subject_id: Optional[int] = None) -> Optional[np.ndarray]:
+        """
+        Extract attention labels with priority:
+        1. Raw EEG files (expinfo.attend_mf) - PRIMARY SOURCE (if available)
+        2. DATA_preproc expinfo.attend_mf (if available in expinfo dict)
+        3. event.eeg.value{1} from preprocessed data - TRUE LABELS from preprocessing pipeline
+        
+        Based on MATLAB preprocessing script (preproc_data.m):
+        - expinfo.attend_mf (1=male, 2=female) is written into data.event.eeg.value during preprocessing
+        - After splitting into trials, each trial has: data{ii}.event.eeg.value{1} = label
+        - This is the TRUE label from expinfo.attend_mf, embedded in the event structure
         
         We convert to binary: 0 = male, 1 = female
+        
+        Args:
+            data_struct: Data structure from DATA_preproc file
+            expinfo: Experimental info dict from DATA_preproc file
+            n_trials: Number of trials expected
+            subject_id: Subject ID (for loading from raw EEG files)
         
         Returns:
             Trial-level labels array of length n_trials (NOT expanded to sample level)
@@ -730,7 +1159,34 @@ class FulsangPreprocessor:
             RuntimeError: If labels cannot be extracted (no fallback)
         """
         try:
-            # Method 1: Extract from expinfo.attend_mf (primary method)
+            # Method 1: Load from raw EEG files (PRIMARY - true labels)
+            if subject_id is not None:
+                if self.eeg_raw_path is None:
+                    # Only print this warning once per subject to avoid spam
+                    if subject_id not in self._raw_labels_cache:
+                        print(f"    ⚠ Raw EEG files not configured for S{subject_id}")
+                        print(f"    ⚠ Expected locations: Data/Fulsang/EEG.zip or Data/Fulsang/EEG/")
+                        print(f"    ⚠ Falling back to DATA_preproc labels (may be trigger codes)")
+                else:
+                    raw_labels = self._load_labels_from_raw_eeg(subject_id)
+                    if raw_labels is not None:
+                        if len(raw_labels) == n_trials:
+                            print(f"    [OK] Using labels from raw EEG files (expinfo.attend_mf) - {len(raw_labels)} trials")
+                            expinfo['label_type'] = 'attend_mf_binary'
+                            expinfo['label_map'] = '0=male,1=female'
+                            expinfo['label_source'] = 'raw_eeg.expinfo.attend_mf'
+                            return raw_labels
+                        else:
+                            print(f"    ⚠ Raw EEG labels length mismatch: {len(raw_labels)} vs {n_trials} trials")
+                            print(f"    ⚠ Falling back to DATA_preproc labels")
+                    else:
+                        # Only print this once per subject
+                        if subject_id not in self._raw_labels_cache:
+                            print(f"    ⚠ Could not load labels from raw EEG for S{subject_id}")
+                            print(f"    ⚠ Checked: {self.eeg_raw_path}")
+                            print(f"    ⚠ Falling back to DATA_preproc labels (may be trigger codes)")
+            
+            # Method 2: Extract from DATA_preproc expinfo.attend_mf (secondary method)
             attend_mf = expinfo.get('attend_mf')
             
             if attend_mf is not None:
@@ -741,7 +1197,7 @@ class FulsangPreprocessor:
                     Returns None if value cannot be converted to a scalar (multi-element arrays/lists).
                     """
                     if val is None:
-                        return None
+                return None
                     # Handle lists/tuples
                     if isinstance(val, (list, tuple)):
                         if len(val) == 0:
@@ -795,6 +1251,10 @@ class FulsangPreprocessor:
                 # Validate length matches n_trials
                 if len(trial_labels) == n_trials:
                     print(f"    [OK] Extracted attention labels from expinfo.attend_mf ({len(trial_labels)} trials)")
+                    # Store label metadata in expinfo for TFRecord writing
+                    expinfo['label_type'] = 'attend_mf_binary'
+                    expinfo['label_map'] = '0=male,1=female'
+                    expinfo['label_source'] = 'expinfo.attend_mf'
                     return trial_labels
                 else:
                     raise RuntimeError(
@@ -802,173 +1262,138 @@ class FulsangPreprocessor:
                         f"but expected {n_trials} trials"
                     )
             
-            # Method 2: Extract from event structure (trigger codes: 1=male, 2=female)
+            # Method 3: Extract from event.eeg.value{1} for each trial (TRUE LABELS from preprocessing)
+            # Based on preproc_data.m:
+            #   events_of_interest = expinfo.attend_mf;  % 1=male, 2=female
+            #   data.event.eeg.value{2*(ii-1)+1} = events_of_interest(ii);
+            # After preprocessing, structure is:
+            #   data.event.eeg is (1, 60) array of event structs (one per trial)
+            #   data.event.eeg[i].value is (1,1) cell array
+            #   data.event.eeg[i].value[0] contains the label (1=male, 2=female)
             if not isinstance(data_struct, np.ndarray) or data_struct.size == 0:
                 raise RuntimeError("Cannot extract labels: data_struct is invalid")
             
-            first_elem = data_struct.flat[0]
-            
-            # Try to get event structure
-            event_field = None
-            if hasattr(first_elem, 'event'):
-                event_field = first_elem.event
-            elif hasattr(first_elem, 'dtype') and hasattr(first_elem.dtype, 'names') and 'event' in first_elem.dtype.names:
-                event_field = first_elem['event']
-            
-            if event_field is None:
-                # Debug: show what attributes are available
-                available_attrs = [k for k in dir(first_elem) if not k.startswith('_')]
+            # data_struct is (1,1) object array containing one struct with all trials
+            if data_struct.dtype != object:
                 raise RuntimeError(
-                    f"Failed to extract attention labels: event structure not found. "
-                    f"Available attributes in data.flat[0]: {available_attrs}. "
-                    f"Expected 'event' attribute."
+                    f"data_struct is not an object array. "
+                    f"Type: {type(data_struct)}, dtype: {data_struct.dtype}, shape: {data_struct.shape}"
                 )
             
             try:
-                # Access event.eeg - it might be a 1×1 struct containing the actual trial data
-                # From diagnostic: event is mat_struct with 'eeg' attribute
-                if hasattr(event_field, 'eeg'):
-                    event_eeg_raw = event_field.eeg
-                elif isinstance(event_field, np.ndarray) and event_field.dtype == object:
-                    event_eeg_raw = event_field
-                else:
+                # Get the main data struct (first element)
+                main_data = data_struct.flat[0]
+                
+                # Access event structure
+                if not hasattr(main_data, 'event'):
                     raise RuntimeError(
-                        f"Event structure found but 'eeg' attribute not accessible. "
-                        f"Event type: {type(event_field)}, attributes: {[k for k in dir(event_field) if not k.startswith('_')][:10]}"
+                        f"Data does not have 'event' attribute. "
+                        f"Available attributes: {[k for k in dir(main_data) if not k.startswith('_')][:10]}"
                     )
                 
-                # Handle case where event_eeg is a 1×1 struct containing the actual data
-                # MATLAB often wraps arrays in 1×1 structs - we need to unwrap it
-                event_eeg = None
+                event = main_data.event
                 
-                # Case 1: event_eeg_raw is already a numpy array
-                if isinstance(event_eeg_raw, np.ndarray):
-                    if event_eeg_raw.dtype == object:
-                        # Check if it's a 1×1 struct that contains the actual array
-                        if event_eeg_raw.size == 1:
-                            # It's a 1×1 wrapper - extract the actual content
-                            wrapped = event_eeg_raw.flat[0]
-                            # The wrapped content might be the actual array of 60 trials
-                            if isinstance(wrapped, np.ndarray) and wrapped.dtype == object:
-                                if wrapped.size >= n_trials:
-                                    event_eeg = wrapped
-                                    print(f"    Unwrapped 1×1 struct: found {wrapped.size} trials inside")
-                                else:
-                                    print(f"    WARNING: Wrapped array has only {wrapped.size} elements, expected {n_trials}")
-                            elif hasattr(wrapped, '__dict__'):
-                                # It's a struct - look for fields that might contain the trial array
-                                wrapped_attrs = [k for k in dir(wrapped) if not k.startswith('_')]
-                                # Try common field names that might contain the 60 trials
-                                for field_name in ['eeg', 'value', 'trial', 'data', 'events']:
-                                    if hasattr(wrapped, field_name):
-                                        field_val = getattr(wrapped, field_name)
-                                        if isinstance(field_val, np.ndarray) and field_val.dtype == object:
-                                            if field_val.size >= n_trials:
-                                                event_eeg = field_val
-                                                break
-                                if event_eeg is None:
-                                    # If no standard field, try to find any object array with >= n_trials elements
-                                    for attr in wrapped_attrs:
-                                        try:
-                                            val = getattr(wrapped, attr)
-                                            if isinstance(val, np.ndarray) and val.dtype == object and val.size >= n_trials:
-                                                event_eeg = val
-                                                print(f"    Found trial array in wrapped.{attr} (size: {val.size})")
-                                                break
-                                        except:
-                                            pass
-                        else:
-                            # It's already the array of trials (not wrapped)
-                            event_eeg = event_eeg_raw
-                    else:
+                # event is (1,1) object array containing one struct
+                if not isinstance(event, np.ndarray) or event.dtype != object or event.size == 0:
                         raise RuntimeError(
-                            f"event.eeg is a numpy array but not object dtype. "
-                            f"Type: {type(event_eeg_raw)}, dtype: {event_eeg_raw.dtype}, shape: {event_eeg_raw.shape}"
-                        )
-                elif hasattr(event_eeg_raw, '__dict__'):
-                    # It's a mat_struct - look for fields containing the trial array
-                    struct_attrs = [k for k in dir(event_eeg_raw) if not k.startswith('_')]
-                    for field_name in ['eeg', 'value', 'trial', 'data', 'events']:
-                        if hasattr(event_eeg_raw, field_name):
-                            field_val = getattr(event_eeg_raw, field_name)
-                            if isinstance(field_val, np.ndarray) and field_val.dtype == object:
-                                if field_val.size >= n_trials:
-                                    event_eeg = field_val
-                                    print(f"    Found trial array in event_eeg_raw.{field_name} (size: {field_val.size})")
-                                    break
-                
-                if event_eeg is None:
-                    raise RuntimeError(
-                        f"Could not extract trial array from event.eeg. "
-                        f"event_eeg_raw type: {type(event_eeg_raw)}, "
-                        f"shape: {getattr(event_eeg_raw, 'shape', 'N/A') if isinstance(event_eeg_raw, np.ndarray) else 'N/A'}, "
-                        f"size: {getattr(event_eeg_raw, 'size', 'N/A') if isinstance(event_eeg_raw, np.ndarray) else 'N/A'}, "
-                        f"attributes: {[k for k in dir(event_eeg_raw) if not k.startswith('_')][:10] if hasattr(event_eeg_raw, '__dict__') else 'N/A'}. "
-                        f"If event_eeg_raw is 1×1, the actual trial array is likely inside a nested field."
+                        f"event is not a valid object array. "
+                        f"Type: {type(event)}, dtype: {getattr(event, 'dtype', 'N/A')}, size: {getattr(event, 'size', 'N/A')}"
                     )
                 
-                if event_eeg.dtype != object:
+                event_struct = event.flat[0]
+                
+                # Access event.eeg - should be (1, n_trials) object array
+                if not hasattr(event_struct, 'eeg'):
                     raise RuntimeError(
-                        f"event.eeg (after unwrapping) is not an object array. "
-                        f"Type: {type(event_eeg)}, dtype: {event_eeg.dtype}, shape: {event_eeg.shape}"
+                        f"event does not have 'eeg' attribute. "
+                        f"Available attributes: {[k for k in dir(event_struct) if not k.startswith('_')][:10]}"
                     )
                 
-                # Use .size to count total elements (handles 2D arrays like (1, 60) or (60, 1))
-                total_trials_in_event = event_eeg.size
-                if total_trials_in_event < n_trials:
+                event_eeg = event_struct.eeg
+                
+                # event.eeg should be (1, n_trials) object array of event structs
+                if not isinstance(event_eeg, np.ndarray) or event_eeg.dtype != object:
                     raise RuntimeError(
-                        f"event.eeg has {total_trials_in_event} elements (shape: {event_eeg.shape}), "
-                        f"but expected {n_trials} trials. "
-                        f"Note: Unwrapped from 1×1 struct, but still don't have enough trials."
+                        f"event.eeg is not an object array. "
+                        f"Type: {type(event_eeg)}, dtype: {getattr(event_eeg, 'dtype', 'N/A')}"
                     )
                 
-                # Extract trigger value from each trial
-                # Use .flat to iterate regardless of array shape (1, 60) or (60, 1) or (60,)
-                trigger_values = []
-                for i in range(n_trials):
-                    if i >= total_trials_in_event:
+                if event_eeg.size < n_trials:
                         raise RuntimeError(
-                            f"Trial index {i} exceeds available events ({total_trials_in_event})"
+                        f"event.eeg has {event_eeg.size} elements, but expected {n_trials} trials"
                         )
                     
+                # Extract labels from each trial's event.eeg[i].value[0]
+                label_values = []
+                
+                for i in range(n_trials):
+                    # Get event struct for trial i
                     trial_event = event_eeg.flat[i]
+                    
+                    # Access value field
                     if not hasattr(trial_event, 'value'):
                         raise RuntimeError(
                             f"Trial {i} event does not have 'value' attribute. "
-                            f"Attributes: {[k for k in dir(trial_event) if not k.startswith('_')][:10]}"
+                            f"Available attributes: {[k for k in dir(trial_event) if not k.startswith('_')][:10]}"
                         )
                     
-                    val = trial_event.value
-                    # Handle scalar or array
-                    if isinstance(val, np.ndarray):
-                        val = val.flatten()
-                        if val.size == 0:
-                            raise RuntimeError(f"Trial {i} event.value is empty array")
-                        trigger_values.append(int(val[0]))
+                    value_cell = trial_event.value
+                    
+                    # value should be (1,1) object array (cell array in MATLAB)
+                    if not isinstance(value_cell, np.ndarray) or value_cell.dtype != object:
+                    raise RuntimeError(
+                            f"Trial {i} event.value is not an object array (cell array). "
+                            f"Type: {type(value_cell)}, dtype: {getattr(value_cell, 'dtype', 'N/A')}"
+                        )
+                    
+                    if value_cell.size == 0:
+                        raise RuntimeError(f"Trial {i} event.value is empty")
+                    
+                    # Extract first element: value{1} in MATLAB = value[0] in Python
+                    label_val = value_cell.flat[0]
+                    
+                    # Convert to scalar int (label_val might be nested array)
+                    if isinstance(label_val, np.ndarray):
+                        label_val = label_val.flatten()
+                        if label_val.size == 0:
+                            raise RuntimeError(f"Trial {i} event.value[0] is empty array")
+                        label_val = int(label_val[0])
                     else:
-                        trigger_values.append(int(val))
+                        label_val = int(label_val)
                 
-                if len(trigger_values) != n_trials:
+                    # Validate value is 1 or 2
+                    if label_val not in [1, 2]:
                     raise RuntimeError(
-                        f"Extracted {len(trigger_values)} trigger values, but expected {n_trials} trials"
+                            f"Trial {i} has invalid label value: {label_val}. Expected 1 (male) or 2 (female)."
+                        )
+                    
+                    label_values.append(label_val)
+                
+                if len(label_values) != n_trials:
+                    raise RuntimeError(
+                        f"Extracted {len(label_values)} labels, but expected {n_trials} trials"
                     )
                 
-                # Validate trigger codes are 1 or 2
-                unique_triggers = set(trigger_values)
-                if not unique_triggers.issubset({1, 2}):
+                # Validate all values are 1 or 2
+                unique_labels = set(label_values)
+                if not unique_labels.issubset({1, 2}):
                     raise RuntimeError(
-                        f"Invalid trigger codes: {unique_triggers}. Expected only 1 and 2. "
-                        f"Found in trials: {[i for i, v in enumerate(trigger_values) if v not in [1, 2]]}"
+                        f"Invalid label values: {unique_labels}. Expected only 1 and 2. "
+                        f"Found in trials: {[i for i, v in enumerate(label_values) if v not in [1, 2]]}"
                     )
                 
-                # Convert trigger to binary label: 1=male->0, 2=female->1
-                trial_labels = np.array([0 if v == 1 else 1 for v in trigger_values], dtype=np.int64)
+                # Convert to binary label: 1=male->0, 2=female->1
+                trial_labels = np.array([0 if v == 1 else 1 for v in label_values], dtype=np.int64)
                 
-                # Also update expinfo with trigger values
-                expinfo['trigger'] = trigger_values
+                # Store metadata
+                expinfo['label_type'] = 'attend_mf_binary'
+                expinfo['label_map'] = '0=male,1=female'
+                expinfo['label_source'] = 'event.eeg.value{1}'  # From preprocessing pipeline
+                expinfo['label_original_values'] = label_values  # Store original 1/2 values for reference
                 
-                print(f"    [OK] Extracted attention labels from event structure (trigger codes) ({len(trial_labels)} trials)")
-                print(f"    Trigger code distribution: {dict(enumerate(np.bincount(trigger_values, minlength=3)[1:3]))}")
+                print(f"    [OK] Extracted attention labels from event.eeg.value{{1}} ({len(trial_labels)} trials)")
+                print(f"    Label distribution: {dict(enumerate(np.bincount(label_values, minlength=3)[1:3]))}")
+                print(f"    [SUCCESS] Using TRUE labels from preprocessing pipeline (expinfo.attend_mf → event.eeg.value)")
                 return trial_labels
                 
             except RuntimeError:
@@ -977,9 +1402,9 @@ class FulsangPreprocessor:
             except Exception as e:
                 # Wrap other exceptions with more context
                 raise RuntimeError(
-                    f"Error extracting labels from event structure: {e}\n"
-                    f"Event field type: {type(event_field)}, "
-                    f"Event field attributes: {[k for k in dir(event_field) if not k.startswith('_')][:10] if hasattr(event_field, '__dict__') else 'N/A'}"
+                    f"Error extracting labels from event.eeg.value: {e}\n"
+                    f"Trial data type: {type(data_struct.flat[0]) if data_struct.size > 0 else 'N/A'}, "
+                    f"Trial attributes: {[k for k in dir(data_struct.flat[0]) if not k.startswith('_')][:10] if data_struct.size > 0 else 'N/A'}"
                 ) from e
             
         except RuntimeError:
@@ -1013,6 +1438,8 @@ class FulsangPreprocessor:
             Number of trials written
         """
         n_trials_written = 0
+        n_trials_with_wavA = 0
+        n_trials_with_wavB = 0
         
         with tf.io.TFRecordWriter(str(tfrecord_file)) as writer:
             # Helper to convert any value to scalar
@@ -1134,6 +1561,16 @@ class FulsangPreprocessor:
                     'n_samples': tf.train.Feature(
                         int64_list=tf.train.Int64List(value=[self.trial_length])
                     ),
+                    # Label metadata (for clarity on what labels mean)
+                    'label_type': tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[expinfo.get('label_type', 'attend_mf_binary').encode('utf-8')])
+                    ),
+                    'label_map': tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[expinfo.get('label_map', '0=male,1=female').encode('utf-8')])
+                    ),
+                    'label_source': tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[expinfo.get('label_source', 'unknown').encode('utf-8')])
+                    ),
                     # Metadata fields
                     'sampling_rate': tf.train.Feature(
                         int64_list=tf.train.Int64List(value=[self.sampling_rate])
@@ -1158,20 +1595,34 @@ class FulsangPreprocessor:
                     features['wavA'] = tf.train.Feature(
                         float_list=tf.train.FloatList(value=trial_wavA.flatten())
                     )
+                    n_trials_with_wavA += 1
                 
                 if trial_wavB is not None:
                     features['wavB'] = tf.train.Feature(
                         float_list=tf.train.FloatList(value=trial_wavB.flatten())
                     )
+                    n_trials_with_wavB += 1
                 
-                # Helper to safely extract expinfo scalar
+                # Helper to safely extract expinfo scalar for this trial
+                # For per-trial fields (arrays of length n_trials), index by trial_idx first, then coerce to scalar
                 def get_expinfo_scalar(field_name):
                     value = expinfo.get(field_name)
                     if value is None:
                         return None
+                    # If it's a per-trial array/list, index by trial_idx first
                     if isinstance(value, (list, np.ndarray)):
                         if trial_idx < len(value):
-                            return value[trial_idx]
+                            trial_value = value[trial_idx]
+                            # Now coerce to scalar (handles nested arrays)
+                            if isinstance(trial_value, np.ndarray):
+                                trial_value = trial_value.squeeze()
+                                if trial_value.size == 1:
+                                    return trial_value.item()
+                                elif trial_value.size == 0:
+                                    return None
+                                # Multi-element - can't convert to scalar
+                                return None
+                            return trial_value
                         return None
                     return value
                 
@@ -1222,18 +1673,64 @@ class FulsangPreprocessor:
                         except (ValueError, TypeError):
                             pass
                 
-                # Add attend_mf raw value (1=male, 2=female) before binary conversion
-                # Note: attend_mf may be None if labels came from trigger codes
+                # Add attend_mf raw value (1=male, 2=female) for this trial
+                # This tells us which speaker is attended, and since wavA = attended speaker,
+                # this also tells us which speaker wavA is
+                attend_mf_raw = None
+                label_original_values = expinfo.get('label_original_values')
+                if label_original_values is not None and isinstance(label_original_values, (list, np.ndarray)):
+                    # label_original_values contains the original 1/2 values from event.eeg.value{1}
+                    if trial_idx < len(label_original_values):
+                        attend_mf_raw = label_original_values[trial_idx]
+                else:
+                    # Fallback: try to get from expinfo.attend_mf
                 attend_mf_raw = get_expinfo_scalar('attend_mf')
+                
                 if attend_mf_raw is not None:
                     attend_mf_scalar = to_scalar(attend_mf_raw)
                     if attend_mf_scalar is not None:
                         try:
+                            attend_mf_int = int(attend_mf_scalar)
+                            if attend_mf_int in [1, 2]:
                             features['attend_mf_raw'] = tf.train.Feature(
-                                int64_list=tf.train.Int64List(value=[int(attend_mf_scalar)])
+                                    int64_list=tf.train.Int64List(value=[attend_mf_int])
+                                )
+                                
+                                # CRITICAL: Store speaker identity for wavA and wavB
+                                # From preproc_data.m:
+                                #   - wavA = attended speaker (from data{ii}.event.eeg.value{1})
+                                #   - wavB = unattended speaker (complement)
+                                # So: wavA_speaker = attend_mf_raw (1=male, 2=female)
+                                #     wavB_speaker = complement (2 if wavA=1, 1 if wavA=2)
+                                wavA_speaker = attend_mf_int  # wavA is the attended speaker
+                                wavB_speaker = 2 if attend_mf_int == 1 else 1  # wavB is the unattended speaker
+                                
+                                features['wavA_speaker'] = tf.train.Feature(
+                                    int64_list=tf.train.Int64List(value=[wavA_speaker])
+                                )
+                                features['wavB_speaker'] = tf.train.Feature(
+                                    int64_list=tf.train.Int64List(value=[wavB_speaker])
                             )
-                        except (ValueError, TypeError):
+                                
+                                # Debug: Print first few trials to verify metadata
+                                if n_trials_written < 3:
+                                    print(f"    [DEBUG] Trial {trial_idx}: attend_mf_raw={attend_mf_int}, wavA_speaker={wavA_speaker}, wavB_speaker={wavB_speaker}")
+                        except (ValueError, TypeError) as e:
+                            if n_trials_written < 3:
+                                print(f"    [WARNING] Failed to write speaker metadata for trial {trial_idx}: {e}")
                             pass
+                else:
+                    # Debug: Warn if metadata is missing
+                    if n_trials_written < 3:
+                        print(f"    [WARNING] Trial {trial_idx}: attend_mf_raw is None - speaker metadata will be missing!")
+                        if label_original_values is None:
+                            print(f"      label_original_values is None in expinfo")
+                        elif not isinstance(label_original_values, (list, np.ndarray)):
+                            print(f"      label_original_values is not a list/array: {type(label_original_values)}")
+                        elif trial_idx >= len(label_original_values):
+                            print(f"      trial_idx {trial_idx} >= len(label_original_values) {len(label_original_values)}")
+                        else:
+                            print(f"      label_original_values[{trial_idx}] = {label_original_values[trial_idx]}")
                 
                 # Add wavfile names if available (normalized to scalar strings)
                 wavfile_male = get_expinfo_scalar('wavfile_male')
@@ -1252,16 +1749,33 @@ class FulsangPreprocessor:
                             bytes_list=tf.train.BytesList(value=[wavfile_str.encode('utf-8')])
                         )
                 
+                # Add wavA/wavB role (which is male/female) if wavfile info is available
+                # This helps with stimulus reconstruction / CCA / TRF later
+                # If wavfile_male/female exist, we can infer which audio stream is which
+                # For now, we don't have this info, so we'll leave it as None/unknown
+                # But the structure is here for when it becomes available
+                wavfile_male_val = get_expinfo_scalar('wavfile_male')
+                wavfile_female_val = get_expinfo_scalar('wavfile_female')
+                # Note: Without wavfile_male/female, we can't determine which stream is which
+                # This would require additional metadata or assumptions about the data structure
+                
                 # Create and write example
                 example = tf.train.Example(features=tf.train.Features(feature=features))
                 writer.write(example.SerializeToString())
                 n_trials_written += 1
         
+        # Print audio saving statistics
+        if n_trials_written > 0:
+            wavA_percent = 100.0 * n_trials_with_wavA / n_trials_written
+            wavB_percent = 100.0 * n_trials_with_wavB / n_trials_written
+            print(f"    Audio saved: wavA={n_trials_with_wavA}/{n_trials_written} ({wavA_percent:.1f}%), wavB={n_trials_with_wavB}/{n_trials_written} ({wavB_percent:.1f}%)")
+        
         return n_trials_written
     
     def _write_manifest(self, manifest_file: Path, subject_id: str, n_trials: int,
                        valid_trials: List[int], attention_labels: np.ndarray,
-                       expinfo: Dict, filtered_reasons: Dict) -> None:
+                       expinfo: Dict, filtered_reasons: Dict,
+                       n_speakers_filter_applied: bool, n_speakers_available: bool) -> None:
         """
         Write manifest JSON with filtering information and condition counts.
         
@@ -1366,15 +1880,49 @@ class FulsangPreprocessor:
         label_dist = dict(enumerate(np.bincount(valid_labels, minlength=2)))
         
         # Helper to convert NumPy types to JSON-serializable Python types
+        # NumPy 2.0 compatibility: np.float_, np.int_, np.bool were removed
         def to_json_serializable(obj):
             """Recursively convert NumPy types to native Python types for JSON serialization."""
-            if isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64)):
+            # Handle integer types (np.int_ removed in NumPy 2.0, so don't include it)
+            if isinstance(obj, (np.integer, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64)):
                 return int(obj)
-            elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
+            # Try to handle np.int_ if it exists (NumPy < 2.0 compatibility)
+            # Note: In NumPy 2.0, accessing np.int_ raises AttributeError, so we must check hasattr first
+            try:
+                if hasattr(np, 'int_'):
+                    np_int_type = getattr(np, 'int_')
+                    if isinstance(obj, np_int_type):
+                        return int(obj)
+            except (AttributeError, TypeError):
+                pass
+            
+            # Handle floating point types (np.float_ removed in NumPy 2.0, so don't include it)
+            if isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
                 return float(obj)
-            elif isinstance(obj, (np.bool_, np.bool)):
+            # Try to handle np.float_ if it exists (NumPy < 2.0 compatibility)
+            # Note: In NumPy 2.0, accessing np.float_ raises AttributeError, so we must use getattr
+            try:
+                if hasattr(np, 'float_'):
+                    np_float_type = getattr(np, 'float_')
+                    if isinstance(obj, np_float_type):
+                        return float(obj)
+            except (AttributeError, TypeError):
+                pass
+            
+            # Handle boolean types (np.bool removed in NumPy 2.0, so don't include it)
+            if isinstance(obj, np.bool_):
                 return bool(obj)
-            elif isinstance(obj, np.ndarray):
+            # Try to handle np.bool if it exists (NumPy < 2.0 compatibility)
+            # Note: In NumPy 2.0, accessing np.bool raises AttributeError, so we must check hasattr first
+            try:
+                if hasattr(np, 'bool'):
+                    np_bool_type = getattr(np, 'bool')
+                    if isinstance(obj, np_bool_type):
+                        return bool(obj)
+            except (AttributeError, TypeError):
+                pass
+            
+            if isinstance(obj, np.ndarray):
                 return obj.tolist()
             elif isinstance(obj, dict):
                 return {key: to_json_serializable(value) for key, value in obj.items()}
@@ -1402,6 +1950,11 @@ class FulsangPreprocessor:
             'label_distribution': label_dist,
             'condition_counts': condition_counts,
             'filter_n_speakers': self.filter_n_speakers,
+            'n_speakers_filter_applied': n_speakers_filter_applied,
+            'n_speakers_available': n_speakers_available,
+            'label_type': expinfo.get('label_type', 'attend_mf_binary'),
+            'label_map': expinfo.get('label_map', '0=male,1=female'),
+            'label_source': expinfo.get('label_source', 'unknown'),
             'sampling_rate': self.sampling_rate,
             'n_channels': self.n_channels,
             'trial_length': self.trial_length,
@@ -1479,6 +2032,12 @@ def main():
         default=False,
         help='If set, fail if audio extraction fails. Otherwise, skip audio fields when missing.'
     )
+    parser.add_argument(
+        '--eeg_raw_dir',
+        type=str,
+        default=None,
+        help='Path to raw EEG files (EEG.zip or EEG/ directory). If not specified, auto-detects Data/Fulsang/EEG.zip or Data/Fulsang/EEG/'
+    )
     
     args = parser.parse_args()
     
@@ -1487,7 +2046,8 @@ def main():
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         filter_n_speakers=args.filter_n_speakers,
-        require_audio=args.require_audio
+        require_audio=args.require_audio,
+        eeg_raw_dir=args.eeg_raw_dir
     )
     
     # Process subjects

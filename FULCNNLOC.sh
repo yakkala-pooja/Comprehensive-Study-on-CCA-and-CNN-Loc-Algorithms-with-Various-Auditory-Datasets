@@ -209,6 +209,17 @@ run_comprehensive_analysis() {
     TFRECORD_DIR="fulsang_preprocessed/tfrecords"
     
     # Run comprehensive analysis (window sweep + hyperparameter tuning)
+    # This will:
+    # 1. Sweep window sizes: 1s, 8s, 16s, 24s, 30s (5 experiments)
+    # 2. Tune hyperparameters for the best window size (5 experiments)
+    # Total: 10 experiments, each with 30 epochs
+    echo "Comprehensive evaluation includes:"
+    echo "  - Window size sweep: 1s, 8s, 16s, 24s, 30s"
+    echo "  - Hyperparameter tuning: 5 experiments"
+    echo "  - Epochs per experiment: 30"
+    echo "  - Total experiments: 10"
+    echo ""
+    
     python3 FULCNNLOC.py \
         --tfrecord_dir "$TFRECORD_DIR" \
         --run_all \
@@ -286,8 +297,12 @@ except Exception as e:
 }
 
 # Actually run the FULCNNLOC training (single experiment)
+# This function runs a single experiment with fixed hyperparameters
+# Good for testing model fixes and faster iteration
 run_fulcnnloc_training() {
     echo "Running FULCNNLOC Training (Single Experiment)"
+    echo "Using parameters: window_size=512, batch_size=32, num_epochs=30"
+    echo ""
     
     if [ ! -f "FULCNNLOC.py" ]; then
         echo "Couldn't find FULCNNLOC.py!"
@@ -303,10 +318,11 @@ run_fulcnnloc_training() {
     TFRECORD_DIR="fulsang_preprocessed/tfrecords"
     
     # Run the training with optimized hyperparameters
+    # Using reduced epochs (30) for faster iteration with model fixes
     python3 FULCNNLOC.py \
         --tfrecord_dir "$TFRECORD_DIR" \
         --batch_size 32 \
-        --num_epochs 50 \
+        --num_epochs 30 \
         --learning_rate 1e-3 \
         --window_size 512 \
         --overlap 0.5 \
@@ -407,8 +423,14 @@ main() {
     fi
     
     echo ""
-    # Run comprehensive analysis (window sweep + hyperparameter tuning)
+    # Choose which mode to run:
+    # Option 1: Single experiment (faster, for testing model fixes)
+    # Option 2: Comprehensive analysis (window sweep + hyperparameter tuning)
+    
+    # Running comprehensive analysis (window sweep + hyperparameter tuning)
     run_comprehensive_analysis || exit 1
+    # To run single experiment instead, uncomment the line below and comment the one above:
+    # run_fulcnnloc_training || exit 1
     
     echo ""
     create_final_summary
