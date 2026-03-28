@@ -1,0 +1,358 @@
+% White paper: Unified CNN-LOC for combined DAS + Fuglsang AAD (full version)
+% Compile: pdflatex WHITE_PAPER_COMBINED_CNN_LOC.tex
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{url}
+\usepackage{verbatim}
+
+\geometry{margin=1in}
+\setlist{itemsep=0.35em, topsep=0.35em}
+
+\title{\textbf{A Unified CNN-LOC Framework for Auditory Attention Decoding\\on Combined DAS and Fuglsang EEG Datasets}}
+\author{Telluride Decoding Project}
+\date{\today}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\newcommand{\py}[1]{\texttt{#1}}
+
+\begin{document}
+\maketitle
+
+% ---------------------------------------------------------------------------
+\begin{abstract}
+We present a unified deep learning framework for auditory attention decoding (AAD) from electroencephalography (EEG), designed to jointly leverage the Das (DAS) and Fuglsang (Fulsang) datasets. The framework centers on a convolutional neural network with spatial--temporal attention (CNN-LOC) adapted from our prior FULCNN architecture. Two complementary training pipelines are implemented: (i) a window-level split (\py{CombinedCNNLOC.py}) for rapid experimentation and optimistic baselines, and (ii) a subject-level split (\py{CombinedCNNLOCSub.py}) with per-subject normalization, bandpass filtering, subject-balanced sampling, and trial-level metrics for realistic generalization assessment. A SLURM orchestration script (\py{Combined.sh}) automates data discovery, preprocessing, and training on GPU clusters. We describe the data preprocessing, model architecture, training procedures, evaluation protocols, and design decisions intended to avoid common pitfalls such as data leakage. This framework enables reproducible and extensible research on EEG-based AAD across heterogeneous datasets.
+\end{abstract}
+
+\noindent\textbf{Keywords:} auditory attention decoding, EEG, deep learning, CNN, subject-level evaluation, combined dataset, SLURM.
+
+% ===========================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Decoding a listener's focus of auditory attention from EEG---often termed auditory attention decoding (AAD)---is a central challenge in brain--computer interfaces and neuro-steered hearing technologies. In a typical AAD paradigm, subjects are presented with two competing speech streams, and the task is to infer from EEG which stream is being attended. Over the past decade, both linear (e.g., canonical correlation analysis, CCA) and nonlinear (e.g., convolutional neural networks, CNNs) methods have been proposed for this problem.
+
+Most reported systems are trained and evaluated on a single dataset, which limits their robustness and external validity. This work addresses that limitation by introducing a unified CNN-LOC framework that jointly handles two widely used AAD datasets:
+\begin{itemize}
+  \item The \textbf{DAS} dataset, preprocessed either via multi-channel Wiener filtering (MWF) or via a 16-subject TFRecord pipeline.
+  \item The \textbf{Fuglsang (Fulsang)} dataset, similarly preprocessed with MWF and associated speech stimuli.
+\end{itemize}
+
+Our objectives are:
+\begin{enumerate}
+  \item To construct a \textbf{CombinedDataset} that harmonizes DAS and Fulsang data into a single representation with consistent sampling rate and channel configuration.
+  \item To adapt the \textbf{CNN-LOC} architecture (originating from FULCNN) to this combined dataset, including robust time--frequency feature extraction.
+  \item To provide two complementary training regimes: a \textbf{window-level split} for rapid prototyping, and a \textbf{subject-level split} that prevents data leakage and yields realistic generalization metrics.
+  \item To implement a \textbf{cluster-ready training pipeline} driven by a SLURM script (\py{Combined.sh}) that discovers data, runs preprocessing when necessary, and executes both CNN-LOC pipelines.
+\end{enumerate}
+
+The remainder of this document details the data processing, model architecture, training and evaluation procedures, and practical usage of the provided scripts.
+
+% ===========================================================================
+\section{Data and Preprocessing}
+\label{sec:data}
+
+\subsection{Datasets}
+\label{sec:datasets}
+
+We use two EEG datasets with two competing speech streams and binary attention labels.
+
+\paragraph{DAS dataset.} Raw data consist of multi-channel EEG stored in \texttt{.mat} files (\texttt{S*.mat}) located under a root such as \py{Data/Das/4004271}. Derived data include: (i) \textbf{MWF-cleaned EEG}, stored in \py{MWF\_cleaned\_DAS} as \texttt{S*\_MWF.mat}, providing artifact-reduced signals; (ii) \textbf{16-subject TFRecords}, stored in \py{das\_16subjects\_preprocessed/tfrecords}, providing a standardized representation for deep learning pipelines.
+
+\paragraph{Fuglsang (Fulsang) dataset.} Raw EEG consists of \texttt{.mat} files (\texttt{S*.mat}) in \py{Data/Fulsang/EEG}. Audio stimuli are located in \py{Data/Fulsang/AUDIO}. MWF-cleaned EEG (legacy) is stored in \py{MWF\_cleaned\_Fuglsang} as \texttt{sub*\_MWF.mat}.
+
+Both datasets contain trial-level annotations indicating which of two speech streams is attended at each time, enabling binary classification labels.
+
+\subsection{CombinedDataset}
+\label{sec:combineddataset}
+
+The \py{CombinedDataset} class (implemented in \py{CombinedDataset.py}) provides a unified interface that merges DAS and Fulsang into a single continuous EEG data structure.
+
+\textbf{Unified sampling rate.} EEG data are resampled to a common sampling rate $f_s = 128$\,Hz.
+
+\textbf{Channel alignment.} EEG channels are mapped into a common channel space across datasets; channels not present in a given recording are handled according to the implementation in \py{CombinedDataset}.
+
+\textbf{Windowization.} Parameters include \texttt{window\_size} (number of samples per window, e.g., 512 samples $= 4$\,s at 128\,Hz, or 1024 samples $= 8$\,s) and \texttt{overlap} (fractional overlap between consecutive windows, e.g., $0.5$ for 50\% overlap or $0.25$ for less correlation between adjacent windows). Each window is described by a tuple
+\[
+  (\text{start\_idx},\ \text{end\_idx},\ \text{label},\ \text{subject\_id},\ \text{trial\_idx},\ \text{dataset}),
+\]
+where \texttt{start\_idx} and \texttt{end\_idx} index into the concatenated EEG, \texttt{label} is the binary attention label, \texttt{subject\_id} identifies the subject, \texttt{trial\_idx} indexes the trial within that subject, and \texttt{dataset} records the source dataset (e.g., DAS vs.\ Fulsang).
+
+The class exposes \py{eeg\_data}, a continuous array of shape $(N_{\text{samples}}, N_{\text{channels}})$, together with \texttt{window\_size}, \texttt{overlap}, \texttt{n\_channels}, and \texttt{sampling\_rate}. A method \py{get\_window\_indices()} returns the list of window descriptors above.
+
+\subsection{Script-level preprocessing logic}
+\label{sec:script_preprocess}
+
+Preprocessing orchestration is handled primarily by \py{Combined.sh} and the main entry points of \py{CombinedCNNLOC.py} and \py{CombinedCNNLOCSub.py}.
+
+\paragraph{DAS data discovery (\py{Combined.sh}).}
+\begin{enumerate}
+  \item If \py{MWF\_cleaned\_DAS} exists and contains \texttt{S*\_MWF.mat}, that directory is used with preprocessing type \texttt{MWF}.
+  \item Else, if \py{das\_16subjects\_preprocessed/tfrecords} exists and contains TFRecord files, that path is used with preprocessing type \texttt{16SUBJECTS} (an alias normalized to \texttt{COMBINED\_DAS} in the Python scripts where applicable).
+  \item Otherwise, raw DAS data in \texttt{DAS\_RAW\_DIR} (defaulting to a cluster path such as \texttt{/home/.../Data/Das/4004271}) are checked. If present, \py{das\_preprocessing\_16subjects.py} is invoked to create TFRecords under \py{das\_16subjects\_preprocessed}.
+\end{enumerate}
+
+\paragraph{Fulsang data.} \py{Combined.sh} verifies that \texttt{FULSANG\_RAW\_DIR} contains \texttt{S*.mat}. It checks \texttt{FULSANG\_MWF\_DIR} for \texttt{sub*\_MWF.mat}; if counts are incomplete relative to raw files, the script warns that MWF processing may be applied during training. \py{CombinedCNNLOCSub.py} can operate when only MWF outputs exist by creating temporary placeholder raw paths to satisfy internal checks; for best label fidelity, true Fulsang raw EEG paths should be supplied.
+
+\paragraph{Automatic DAS preprocessing (\py{CombinedCNNLOC.py}).} For the \texttt{COMBINED\_DAS} pipeline, if TFRecords under \py{das\_combined\_preprocessed/tfrecords} (i.e., \texttt{das\_data\_dir/tfrecords}) are missing and the flag \texttt{--no\_auto\_das\_preprocess} is not set, the script invokes \py{das\_preprocessing\_combined.py} with the configured raw and audio directories.
+
+% ===========================================================================
+\section{Model Architecture: CNN-LOC}
+\label{sec:model}
+
+The CNN-LOC model is adapted from the FULCNN architecture, designed for EEG-based AAD in a time--frequency representation.
+
+\subsection{Time--frequency feature extraction}
+\label{sec:tf}
+
+Both training scripts wrap \py{CombinedDataset} in a PyTorch \texttt{Dataset} class \py{CombinedCNNLOCDataset}. For each EEG window of shape $(N_{\text{samples}}, N_{\text{channels}})$:
+\begin{enumerate}
+  \item The time dimension is divided into $T = 32$ frames.
+  \item For each frame and channel, a real-valued FFT is applied along the temporal samples within the frame; magnitudes of the first $F = 4$ frequency bins are retained (with zero-padding if necessary).
+  \item The result is reshaped to a tensor of shape $(C, T, F) = (N_{\text{channels}}, 32, 4)$.
+\end{enumerate}
+
+In \py{CombinedCNNLOCSub.py}, an \textbf{optional bandpass filter} (e.g., 1--40\,Hz) may be applied to the window before transformation, using a fourth-order Butterworth filter (\texttt{scipy.signal}).
+
+\textbf{Differences between scripts.} \py{CombinedCNNLOC.py} applies per-window mean removal and per-channel standard deviation normalization. \py{CombinedCNNLOCSub.py} uses \textbf{per-subject} channel-wise mean and standard deviation computed over all windows belonging to that subject (Section~\ref{sec:subject}), falling back to per-window normalization when subject statistics are unavailable.
+
+\subsection{Spatial--temporal attention}
+\label{sec:attention}
+
+The \textbf{SpatialTemporalAttention} module implements channel-wise attention. Let $X$ denote the feature map. Global average pooling (GAP) over time and frequency yields a descriptor per channel. A two-layer $1{\times}1$ convolutional network with ReLU and sigmoid produces channel weights:
+\begin{equation}
+  \mathbf{a} = \sigma\bigl(W_2\,\mathrm{ReLU}(W_1\,\mathrm{GAP}(X))\bigr),
+\end{equation}
+and the output is $X'_{c,:,:} = a_c\, X_{c,:,:}$. This reweights channels to emphasize electrodes that are more informative for the task.
+
+\subsection{Residual blocks}
+\label{sec:residual}
+
+Each \textbf{ResidualBlock} consists of two $3{\times}3$ convolutional layers with batch normalization and ReLU; if input and output channel dimensions or stride differ, a $1{\times}1$ convolutional shortcut is used. Spatial--temporal attention is applied to the second convolutional output. The residual connection is added and followed by ReLU. This structure stabilizes training and supports deeper representations.
+
+\subsection{Multi-scale feature extraction}
+\label{sec:multiscale}
+
+The \textbf{MultiScaleFeatureExtractor} applies two parallel convolutions: a $1{\times}1$ convolution (local channel mixing) and a $3{\times}1$ convolution (temporal context along the time axis of the time--frequency map). Outputs are concatenated along the channel dimension, then batch-normalized and passed through ReLU, capturing patterns at multiple temporal scales.
+
+\subsection{CNN-LOC backbone}
+\label{sec:backbone}
+
+The \textbf{CNNLOCBackbone} stacks the above components hierarchically.
+
+\paragraph{Configuration in \py{CombinedCNNLOC.py} (window-level pipeline).} Initial multi-scale features expand to 32 channels. Two temporal residual blocks with max-pooling along the time dimension are followed by two spatial residual blocks with pooling along the frequency dimension, increasing width up to 128 channels. Global spatial--temporal attention operates on 128 channels. Adaptive average pooling to a single spatial--temporal cell yields a feature vector whose dimension is determined by a dummy forward pass at initialization.
+
+\paragraph{Configuration in \py{CombinedCNNLOCSub.py} (subject-level pipeline).} Capacity is reduced to improve cross-subject generalization: initial features use 16 channels; temporal blocks progress 16$\to$16 and 16$\to$32; spatial blocks 32$\to$32 and 32$\to$64; global attention on 64 channels. The same adaptive pooling and flattening strategy applies.
+
+\subsection{Classifier head}
+\label{sec:classifier}
+
+The \textbf{CNNLOCModel} concatenates the backbone with a fully connected classifier. The backbone output dimension $D$ is fed through dropout, a linear layer to 128 units, normalization (LayerNorm in \py{CombinedCNNLOC.py}; BatchNorm1d in \py{CombinedCNNLOCSub.py}), ReLU, dropout, linear to 32 units, normalization, ReLU, dropout, and a final linear layer to two logits (binary classification).
+
+Weight initialization: Kaiming normal for convolutions; batch normalization scale one and bias zero; linear layers use small-variance Gaussian weights and zero bias. The total parameter count is printed at model construction.
+
+% ===========================================================================
+\section{Training and Evaluation Protocols}
+\label{sec:training}
+
+\subsection{Window-level splitting (\py{CombinedCNNLOC.py})}
+\label{sec:window_split}
+
+The full set of windows is randomly partitioned into training (e.g., 70\%), validation (15\%), and test (15\%) using a fixed random seed. Because windows may overlap heavily within the same trial, \textbf{highly similar segments can appear in both training and test}, which constitutes a form of \textbf{data leakage} and can inflate reported accuracy relative to true generalization to new segments or subjects.
+
+Training uses cross-entropy loss, the AdamW optimizer, and OneCycleLR stepped once per batch. Gradient norms are clipped (e.g., maximum norm 1.0). Early stopping monitors validation accuracy, saves the best checkpoint to \py{best\_model.pth}, and stops after a patience interval without improvement.
+
+At test time, the best validation model is loaded. Metrics include window-level accuracy and ROC-AUC when both classes appear in the test set. Summary statistics and timestamps are written to \py{results.json} under the chosen output directory (default \py{combined\_cnnloc\_results}).
+
+This configuration is appropriate for quick experiments, debugging, and optimistic baselines; it is \textbf{not} sufficient alone for claims about cross-subject generalization.
+
+\subsection{Subject-level splitting and robustness (\py{CombinedCNNLOCSub.py})}
+\label{sec:subject}
+
+\subsubsection{Subject-level split}
+
+Windows are grouped by \texttt{subject\_id}. Subjects are randomly shuffled (fixed seed). A fraction (e.g., 70\%) of subjects are assigned to training; the remainder are split between validation and test so that validation and test sets contain comparable numbers of held-out subjects. No subject appears in more than one split. The implementation explicitly checks for index overlap between splits and for subject overlap between train/val/test.
+
+Optional \textbf{$k$-fold subject-level cross-validation}: subjects are partitioned into $k$ folds; one fold is test, an adjacent fold is validation, and the remaining folds form the training set. Per-fold metrics are aggregated (mean $\pm$ standard deviation) and saved to \py{cv\_results.json}.
+
+\subsubsection{Per-subject normalization}
+\label{sec:per_subject_norm}
+
+For each subject, all EEG samples from that subject's windows are aggregated and per-channel mean and variance are estimated (Welford-style online statistics for numerical stability). Each window is then normalized by subtracting the subject's channel means and dividing by subject channel standard deviations (with safeguards for zero variance). This reduces the risk that the classifier exploits trivial subject-specific DC offset or scale rather than attention-related dynamics.
+
+\subsubsection{Class and subject balancing}
+
+\textbf{Class balancing.} From the training subset, class frequencies are counted. If both classes are present, class weights $w_k \propto 1/n_k$ are computed and passed to cross-entropy (optionally normalized so mean weight is one). The flag \texttt{--no\_class\_weights} disables this behavior.
+
+\textbf{Subject-balanced sampling.} A \texttt{WeightedRandomSampler} can assign each training window a weight inversely proportional to the number of windows from that subject, so that subjects with fewer windows are not drowned out by subjects with many windows.
+
+\subsubsection{Data augmentation}
+
+During training, optional \textbf{Gaussian noise} (standard deviation \texttt{augment\_std}) is added to inputs. \textbf{Channel dropout} randomly zeros a fraction of channels per batch (\texttt{augment\_channel\_dropout}), encouraging distributed representations.
+
+\subsubsection{Trial-level metrics}
+
+Beyond window-level accuracy, the framework computes \textbf{trial-level} performance. For each pair $(\text{subject\_id}, \text{trial\_idx})$, all window predictions belonging to that trial are collected; the trial-level prediction is the majority vote (mean rounded). Trial-level accuracy and balanced accuracy are reported. When validation data permit, early stopping can be driven by trial-level validation accuracy rather than window-level accuracy alone, aligning model selection with the metric of interest in many AAD applications.
+
+\subsubsection{Window sweep and single-run modes}
+
+By default, if \texttt{--single\_run} is not specified, the script runs a \textbf{systematic sweep} of window durations from 1\,s to 30\,s (in steps of one second at 128\,Hz), training with subject-level split for each window length and recording trial-level metrics. Results are saved to \py{window\_sweep\_1s\_to\_30s.csv} and optionally plotted as \py{window\_sweep\_1s\_to\_30s.png}.
+
+With \texttt{--single\_run}, a single configuration is executed: user-chosen \texttt{window\_size}, \texttt{overlap}, split method (\texttt{subject}, \texttt{window}, or \texttt{both} for comparison logging while training on subject split), and optional CV. Outputs include \py{best\_model.pth}, \py{results.json}, and fold-specific directories when \texttt{cv\_folds} $> 1$.
+
+\subsubsection{Training loop details}
+
+The optimizer remains AdamW with OneCycleLR (note: stepping behavior may differ slightly between the two scripts; subject-level code steps the scheduler per epoch in one path). Label smoothing is optional. The best checkpoint is selected according to the chosen validation criterion (trial-level when available).
+
+% ===========================================================================
+\section{Implementation and Orchestration}
+\label{sec:impl}
+
+\subsection{\py{CombinedCNNLOC.py}}
+
+This script implements the CNN-LOC pipeline with window-level random splitting. It optionally ensures DAS combined TFRecords exist, instantiates \py{CombinedDataset} with user-specified paths and windowing, wraps data in \py{CombinedCNNLOCDataset}, performs train/validation/test split at the window level, constructs \py{CNNLOCModel} with input channels matching \texttt{n\_channels} from the combined dataset, trains with \py{CNNLOCTrainer}, evaluates on the test loader, and writes \py{results.json} and the best model under the output directory.
+
+Command-line arguments include DAS and Fulsang directory paths, \texttt{das\_preprocessing\_type} (\texttt{COMBINED\_DAS}, \texttt{MWF}, etc.), \texttt{window\_size}, \texttt{overlap}, batch size, epochs, learning rate, dropout, and \texttt{output\_dir}.
+
+\subsection{\py{CombinedCNNLOCSub.py}}
+
+This script extends the pipeline with subject-aware logic: Fulsang raw path handling when only MWF exists; \py{CombinedCNNLOCDataset} with bandpass and per-subject normalization; subject-level or window-level or comparative splits; optional $k$-fold CV; subject-balanced sampler; class weights; augmentation; trial-level validation and test metrics; window sweep or single run. Default output root is \py{combined\_cnnloc\_sub\_results}, with sweep artifacts and per-fold subdirectories as applicable.
+
+\subsection{\py{Combined.sh}}
+
+\py{Combined.sh} is a SLURM batch script (job name, GPU, memory, CPUs, wall time, partition, and account are set via \texttt{\#SBATCH} directives and should be adapted to the target cluster). At runtime it:
+
+\begin{enumerate}
+  \item Prints job metadata (date, job ID, node).
+  \item Resolves DAS data as in Section~\ref{sec:script_preprocess}, optionally running \py{das\_preprocessing\_16subjects.py}.
+  \item Verifies Fulsang raw and MWF directories.
+  \item Invokes \py{CombinedCNNLOC.py} with fixed hyperparameters (e.g., \texttt{window\_size=512}, \texttt{overlap=0.5}, batch size 32, 50 epochs, learning rate $10^{-3}$), logging to \py{combined\_cnnloc\_training.log}.
+  \item Invokes \py{CombinedCNNLOCSub.py} with the same DAS/Fulsang paths and similar training budget, logging to \py{combined\_cnnloc\_sub\_training.log}.
+  \item Summarizes success or failure. A commented block shows how \py{CombinedCCA.py} could be run for CCA-based training when desired.
+\end{enumerate}
+
+Environment variables such as \texttt{DAS\_RAW\_DIR}, \texttt{FULSANG\_RAW\_DIR}, \texttt{FULSANG\_AUDIO\_DIR}, and \texttt{FULSANG\_MWF\_DIR} may be set before submission to override default paths.
+
+% ===========================================================================
+\section{Discussion and Recommended Usage}
+\label{sec:discussion}
+
+The unified CNN-LOC framework balances engineering practicality with scientific rigor. \textbf{Window-level splitting} (\py{CombinedCNNLOC.py}) supports rapid debugging, architecture search, and upper-bound performance estimates on mixed windows; however, leakage across overlapping windows makes it unsuitable as the sole basis for reporting generalization to new subjects.
+
+\textbf{Subject-level splitting with trial-level metrics} (\py{CombinedCNNLOCSub.py}) provides a conservative and realistic assessment of cross-subject performance, which is essential for clinical or real-world deployment. Per-subject normalization, subject-balanced sampling, and trial-wise majority voting contribute to a fairer evaluation.
+
+For new experiments or publications, we recommend: (i) primary reporting from \py{CombinedCNNLOCSub.py} with subject-level split, window lengths of 4--8\,s (512--1024 samples at 128\,Hz), bandpass filtering 1--40\,Hz where appropriate, per-subject normalization and class balancing, and trial-level metrics; (ii) optional window sweeps (1--30\,s) to characterize the accuracy--latency trade-off; (iii) use of \py{CombinedCNNLOC.py} mainly for exploratory or ablation studies.
+
+% ===========================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented a comprehensive CNN-LOC framework for auditory attention decoding that operates on a combined dataset built from DAS and Fulsang EEG recordings. The system includes robust data harmonization, a purpose-built CNN-LOC architecture with spatial--temporal attention, two complementary training pipelines (window-level and subject-level), and cluster-friendly orchestration via \py{Combined.sh}. The subject-level pipeline offers a principled foundation for reproducible, scientifically defensible evaluation of EEG-based AAD across heterogeneous data sources.
+
+% ===========================================================================
+\appendix
+\section{Practical usage: example commands}
+\label{app:commands}
+
+\subsection{Prerequisites}
+
+Python environment with PyTorch, NumPy, scikit-learn, tqdm, SciPy, and optionally Matplotlib. Repository root should contain \py{CombinedDataset.py}, preprocessing scripts, and data at paths consistent with the arguments below (adapt paths for Windows vs.\ Linux clusters).
+
+\subsection{\py{CombinedCNNLOC.py} (window-level split)}
+
+\begin{verbatim}
+python3 CombinedCNNLOC.py \
+  --das_data_dir das_combined_preprocessed \
+  --das_preprocessing_type COMBINED_DAS \
+  --das_original_dir /path/to/Data/Das/4004271 \
+  --das_audio_dir /path/to/Data/Das/4004271/stimuli/stimuli \
+  --fulsang_raw_dir /path/to/Data/Fulsang/EEG \
+  --fulsang_audio_dir /path/to/Data/Fulsang/AUDIO \
+  --fulsang_mwf_dir MWF_cleaned_Fuglsang \
+  --combined_dataset_dir combined_dataset \
+  --split_method window \
+  --window_size 512 \
+  --overlap 0.5 \
+  --batch_size 32 \
+  --num_epochs 50 \
+  --learning_rate 1e-3 \
+  --dropout_rate 0.3 \
+  --output_dir combined_cnnloc_results
+\end{verbatim}
+
+\subsection{\py{CombinedCNNLOCSub.py}: window sweep (default)}
+
+Omitting \texttt{--single\_run} runs 1--30\,s sweep with subject-level split per window length:
+
+\begin{verbatim}
+python3 CombinedCNNLOCSub.py \
+  --das_data_dir das_combined_preprocessed \
+  --das_preprocessing_type COMBINED_DAS \
+  --fulsang_raw_dir /path/to/Data/Fulsang/EEG \
+  --fulsang_audio_dir /path/to/Data/Fulsang/AUDIO \
+  --fulsang_mwf_dir /path/to/MWF_cleaned_Fuglsang \
+  --output_dir combined_cnnloc_sub_results
+\end{verbatim}
+
+\subsection{\py{CombinedCNNLOCSub.py}: single run (subject split)}
+
+\begin{verbatim}
+python3 CombinedCNNLOCSub.py --single_run \
+  --das_data_dir das_combined_preprocessed \
+  --das_preprocessing_type COMBINED_DAS \
+  --fulsang_raw_dir /path/to/Data/Fulsang/EEG \
+  --fulsang_audio_dir /path/to/Data/Fulsang/AUDIO \
+  --fulsang_mwf_dir /path/to/MWF_cleaned_Fuglsang \
+  --split_method subject \
+  --window_size 1024 \
+  --overlap 0.25 \
+  --bandpass_low 1.0 \
+  --bandpass_high 40.0 \
+  --batch_size 32 \
+  --num_epochs 80 \
+  --learning_rate 5e-4 \
+  --dropout_rate 0.5 \
+  --weight_decay 1e-4 \
+  --output_dir combined_cnnloc_sub_results
+\end{verbatim}
+
+\subsection{SLURM}
+
+\begin{verbatim}
+export DAS_RAW_DIR=/path/to/Das
+export FULSANG_RAW_DIR=/path/to/Fulsang/EEG
+sbatch Combined.sh
+\end{verbatim}
+
+\subsection{Key output artifacts}
+
+\begin{tabular}{@{}ll@{}}
+\toprule
+Script & Primary outputs \\
+\midrule
+\py{CombinedCNNLOC.py} & \py{combined\_cnnloc\_results/best\_model.pth}, \py{results.json} \\
+\py{CombinedCNNLOCSub.py} (sweep) & \py{window\_sweep\_1s\_to\_30s.csv}, \py{.png} \\
+\py{CombinedCNNLOCSub.py} (single) & \py{best\_model.pth}, \py{results.json}; CV: \py{cv\_results.json} \\
+\py{Combined.sh} & \py{combined\_cnnloc\_training.log}, \py{combined\_cnnloc\_sub\_training.log} \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\noindent\textbf{Related repository files:} \py{CombinedCNNLOC.py}, \py{CombinedCNNLOCSub.py}, \py{Combined.sh}, \py{CombinedDataset.py}, \py{das\_preprocessing\_combined.py}, \py{das\_preprocessing\_16subjects.py}, \py{mwf\_artifact\_removal.py} (when using MWF pipelines).
+
+\end{document}

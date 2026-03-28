@@ -19,6 +19,7 @@ import numpy as np
 import scipy.io as sio
 from scipy import signal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Tuple, Optional, Union
 import logging
 from tqdm import tqdm
@@ -656,6 +657,67 @@ class DasDatasetMWF:
         return all_results
 
 
+def _load_expinfo_sidecar_fuglsang(eeg_base_path: Path, subject_id: int) -> Optional[SimpleNamespace]:
+    """Load attend_mf and attend_lr from S{n}_expinfo.mat (from save_expinfo_only.m). Returns SimpleNamespace or None.
+    Looks in eeg_base_path, Exp_Info/, parent/Exp_Info, and standalone Exp_Info (repo root / cwd)."""
+    repo_root = Path(__file__).resolve().parent
+    cwd = Path.cwd()
+    bases = [
+        eeg_base_path, eeg_base_path / "Exp_Info", eeg_base_path / "exp_info",
+        repo_root / "Exp_Info", repo_root / "exp_info", cwd / "Exp_Info", cwd / "exp_info",
+    ]
+    if hasattr(eeg_base_path, 'parent') and eeg_base_path.parent:
+        bases.extend([eeg_base_path.parent, eeg_base_path.parent / "Exp_Info", eeg_base_path.parent / "exp_info"])
+    for base in bases:
+        if base is None or not base.exists():
+            continue
+        path = base / f"S{subject_id}_expinfo.mat"
+        if not path.exists():
+            continue
+        try:
+            mat = sio.loadmat(str(path), squeeze_me=True, struct_as_record=False)
+            attend_mf = mat.get('attend_mf')
+            attend_lr = mat.get('attend_lr')
+            if attend_mf is None or attend_lr is None:
+                exp = mat.get('expinfo') or mat.get('exp_info')
+                if exp is not None:
+                    if attend_mf is None and (hasattr(exp, 'attend_mf') or (isinstance(exp, dict) and 'attend_mf' in exp)):
+                        attend_mf = exp.attend_mf if hasattr(exp, 'attend_mf') else exp['attend_mf']
+                    if attend_lr is None and (hasattr(exp, 'attend_lr') or (isinstance(exp, dict) and 'attend_lr' in exp)):
+                        attend_lr = exp.attend_lr if hasattr(exp, 'attend_lr') else exp['attend_lr']
+            if attend_mf is not None or attend_lr is not None:
+                attend_mf = np.atleast_1d(np.asarray(attend_mf).flatten()) if attend_mf is not None else None
+                attend_lr = np.atleast_1d(np.asarray(attend_lr).flatten()) if attend_lr is not None else None
+                return SimpleNamespace(attend_mf=attend_mf, attend_lr=attend_lr)
+        except Exception:
+            continue
+    return None
+
+
+def _log_expinfo_structure(expinfo, subject_id: int, log):
+    """Log expinfo field names and presence of attend_mf/attend_lr for debugging."""
+    try:
+        fields = []
+        if hasattr(expinfo, '_fieldnames'):
+            fields = list(expinfo._fieldnames)
+        elif hasattr(expinfo, 'dtype') and getattr(expinfo.dtype, 'names', None):
+            fields = list(expinfo.dtype.names)
+        elif isinstance(expinfo, dict):
+            fields = list(expinfo.keys())
+        else:
+            fields = [k for k in dir(expinfo) if not k.startswith('_')]
+        log.info(f"  expinfo (subject {subject_id}) field names: {fields}")
+        for name in ['attend_mf', 'attend_lr', 'attendMf', 'attendLr']:
+            v = getattr(expinfo, name, None) if not isinstance(expinfo, dict) else expinfo.get(name)
+            if v is not None:
+                arr = np.asarray(v).flatten()
+                log.info(f"    expinfo.{name}: length {len(arr)}, sample {arr[:5].tolist()}")
+            else:
+                log.info(f"    expinfo.{name}: not present")
+    except Exception as e:
+        log.warning(f"  Could not inspect expinfo: {e}")
+
+
 class FuglsangDatasetMWF:
     """
     Fuglsang dataset loader and MWF processor.
@@ -670,11 +732,15 @@ class FuglsangDatasetMWF:
     def __init__(self, 
                  eeg_base_path: str = "/home/py9363/telluride_decoding/Data/Fulsang/EEG",
                  audio_base_path: str = "Data/Fulsang/AUDIO",
-                 output_dir: str = "MWF_cleaned_Fuglsang"):
+                 output_dir: str = "MWF_cleaned_Fuglsang",
+                 truncate_to_sidecar_labels: bool = True,
+                 force_segment_from_events: bool = True):
         self.eeg_base_path = Path(eeg_base_path)
         self.audio_base_path = Path(audio_base_path) if audio_base_path else None
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.truncate_to_sidecar_labels = bool(truncate_to_sidecar_labels)
+        self.force_segment_from_events = bool(force_segment_from_events)
         
         self.original_sampling_rate = 512  # Hz
         self.target_sampling_rate = 128  # Hz (downsample to match Das)
@@ -683,15 +749,18 @@ class FuglsangDatasetMWF:
         logger.info(f"  EEG directory: {self.eeg_base_path}")
         logger.info(f"  Output directory: {self.output_dir}")
         logger.info(f"  Downsampling: {self.original_sampling_rate} Hz -> {self.target_sampling_rate} Hz")
+        logger.info(f"  Trial/label alignment: {'truncate to sidecar labels' if self.truncate_to_sidecar_labels else 'no truncation'}")
+        logger.info(f"  Trialization: {'force segment from data.event.eeg' if self.force_segment_from_events else 'use pre-segmented if present'}")
     
     def load_raw_eeg_data(self, subject_id: int) -> Dict:
-        """Load raw EEG data for a subject."""
+        """Load raw EEG data for a subject. Tries S{id}.mat then S{id}_data_preproc.mat."""
         eeg_file = self.eeg_base_path / f"S{subject_id}.mat"
-        
         if not eeg_file.exists():
-            raise FileNotFoundError(f"EEG file not found: {eeg_file}")
+            eeg_file = self.eeg_base_path / f"S{subject_id}_data_preproc.mat"
+        if not eeg_file.exists():
+            raise FileNotFoundError(f"EEG file not found: {self.eeg_base_path / f'S{subject_id}.mat'} or _data_preproc.mat")
         
-        logger.info(f"Loading raw EEG data for subject {subject_id}")
+        logger.info(f"Loading raw EEG data for subject {subject_id} from {eeg_file.name}")
         
         try:
             mat_data = sio.loadmat(str(eeg_file), squeeze_me=True, struct_as_record=False)
@@ -716,13 +785,35 @@ class FuglsangDatasetMWF:
             if data is None:
                 raise ValueError(f"Could not find data structure in {eeg_file}")
             
-            # Extract experimental info
+            # Extract experimental info (must be in .mat as 'expinfo' or 'exp_info'; key 'None' is not expinfo)
             expinfo = mat_data.get('expinfo', {})
             if not expinfo:
                 for info_name in ['exp_info', 'experiment_info', 'info']:
                     if info_name in mat_data:
                         expinfo = mat_data[info_name]
                         break
+                else:
+                    expinfo = {}
+            
+            # If raw file has no usable attend_mf/attend_lr, load from sidecar S*_expinfo.mat (from save_expinfo_only.m)
+            def _has_attend(exp):
+                if exp is None or (isinstance(exp, dict) and not exp):
+                    return False
+                if hasattr(exp, 'attend_mf') or hasattr(exp, 'attend_lr'):
+                    return True
+                if isinstance(exp, dict) and ('attend_mf' in exp or 'attend_lr' in exp):
+                    return True
+                return False
+            if not _has_attend(expinfo):
+                sidecar_expinfo = _load_expinfo_sidecar_fuglsang(self.eeg_base_path, subject_id)
+                if sidecar_expinfo is not None:
+                    expinfo = sidecar_expinfo
+                    logger.info(f"  Using expinfo from sidecar S{subject_id}_expinfo.mat")
+            
+            # Log expinfo structure once so we can see if attend_mf / attend_lr exist
+            if not getattr(self, '_expinfo_structure_logged', False) and expinfo is not None:
+                _log_expinfo_structure(expinfo, subject_id, logger)
+                self._expinfo_structure_logged = True
             
             # Parse EEG data structure
             parsed_data = self._parse_eeg_structure(data, subject_id)
@@ -1313,20 +1404,15 @@ class FuglsangDatasetMWF:
         logger.info(f"Segmented continuous EEG into {len(trials)} trials")
         right_count = sum(1 for v in trial_event_mapping.values() if v == 191)
         left_count = sum(1 for v in trial_event_mapping.values() if v == 192)
-        logger.info(f"  Attention labels: {right_count} Right (191), {left_count} Left (192)")
+        logger.info(f"  Event codes (191=Right, 192=Left): {right_count} × 191, {left_count} × 192 (used for segmentation only; labels may come from expinfo)")
         
-        # Warn about severe class imbalance
+        # Warn about severe class imbalance only when event-based labels would be used (no expinfo fallback in this method)
         if right_count > 0 and left_count > 0:
             imbalance_ratio = max(right_count, left_count) / min(right_count, left_count)
             if imbalance_ratio > 10:
-                logger.warning(f"  ⚠️  SEVERE CLASS IMBALANCE: {imbalance_ratio:.1f}:1 ratio detected!")
-                logger.warning(f"     This may cause poor model performance. Consider:")
-                logger.warning(f"     - Using class weights in training (e.g., weighted CrossEntropyLoss)")
-                logger.warning(f"     - Data augmentation for minority class")
-                logger.warning(f"     - Oversampling/undersampling techniques")
+                logger.warning(f"  ⚠️  Event-code imbalance: {imbalance_ratio:.1f}:1 (191 vs 192). If expinfo is loaded, trial labels will use expinfo instead.")
         elif left_count == 0 or right_count == 0:
-            logger.warning(f"  ⚠️  CRITICAL: Only one class present ({right_count} Right, {left_count} Left)")
-            logger.warning(f"     Model cannot learn binary classification with single class!")
+            logger.warning(f"  ⚠️  Event codes: only one code present ({right_count} × 191, {left_count} × 192). Trial labels will use expinfo if available.")
         if len(trials) > 0:
             logger.debug(f"  Trial shapes: {[t.shape for t in trials[:3]]}...")  # Show first 3 trial shapes
         
@@ -1356,6 +1442,11 @@ class FuglsangDatasetMWF:
             eeg_trials, trial_event_mapping = self._segment_continuous_eeg_with_labels(eeg_data, events)
         elif isinstance(eeg_data, list):
             # Already segmented into trials
+            if self.force_segment_from_events:
+                raise ValueError(
+                    "force_segment_from_events=True but EEG is already pre-segmented (list). "
+                    "Provide a continuous EEG file (data.eeg as 2D array) or disable force mode."
+                )
             eeg_trials = eeg_data
             logger.info(f"Using pre-segmented trials: {len(eeg_trials)} trials")
         else:
@@ -1379,9 +1470,39 @@ class FuglsangDatasetMWF:
             if isinstance(attention_labels, np.ndarray):
                 attention_labels = attention_labels.flatten().tolist()
             logger.info(f"Found attend_lr in expinfo: {len(attention_labels)} labels")
+        # Log expinfo left/right distribution (attend_lr: 1=left, 2=right) so it's clear we use this, not event 191/192 counts
+        if hasattr(expinfo, 'attend_lr'):
+            lr = np.atleast_1d(np.asarray(expinfo.attend_lr).flatten())
+            left_exp = int(np.sum(lr == 1))
+            right_exp = int(np.sum(lr == 2))
+            logger.info(f"  expinfo attend_lr: {left_exp} Left, {right_exp} Right (used for trial labels)")
+            if left_exp > 0 and right_exp > 0:
+                ratio = max(left_exp, right_exp) / min(left_exp, right_exp)
+                if ratio > 10:
+                    logger.warning(f"  ⚠️  SEVERE CLASS IMBALANCE in expinfo: {ratio:.1f}:1")
+                else:
+                    logger.info(f"  (Labels from expinfo; event codes 191/192 used only for segmentation.)")
+        elif attention_labels and hasattr(expinfo, 'attend_mf'):
+            v1 = sum(1 for x in attention_labels if x == 1)
+            v2 = sum(1 for x in attention_labels if x == 2)
+            logger.info(f"  expinfo attend_mf: {v1} value 1, {v2} value 2")
         
-        for trial_idx, eeg_data in enumerate(tqdm(eeg_trials, desc=f"Processing S{subject_id}")):
+        # Enforce 1:1 alignment between EEG trials and expinfo labels (sidecar/raw).
+        # Some files contain extra EEG segments with no label (practice/aborted/partial).
+        trial_indices_to_use = list(range(len(eeg_trials)))
+        if self.truncate_to_sidecar_labels and attention_labels is not None and len(attention_labels) > 0:
+            if len(eeg_trials) != len(attention_labels):
+                n_use = min(len(eeg_trials), len(attention_labels))
+                logger.warning(
+                    f"Trial/label count mismatch for S{subject_id}: EEG trials={len(eeg_trials)} vs labels={len(attention_labels)}. "
+                    f"Using first {n_use} trials for 1:1 alignment."
+                )
+                trial_indices_to_use = list(range(n_use))
+                attention_labels = attention_labels[:n_use]
+
+        for used_trial_idx, orig_trial_idx in enumerate(tqdm(trial_indices_to_use, desc=f"Processing S{subject_id}")):
             try:
+                eeg_data = eeg_trials[orig_trial_idx]
                 # Ensure eeg_data is 2D (samples x channels)
                 if len(eeg_data.shape) == 1:
                     eeg_data = eeg_data.reshape(-1, 1)
@@ -1403,15 +1524,15 @@ class FuglsangDatasetMWF:
                 attention_label = None
                 
                 # Method 1: Use expinfo labels (most reliable)
-                if attention_labels is not None and len(attention_labels) > 0 and trial_idx < len(attention_labels):
-                    attention_label = attention_labels[trial_idx]
+                if attention_labels is not None and len(attention_labels) > 0 and used_trial_idx < len(attention_labels):
+                    attention_label = attention_labels[used_trial_idx]
                     # Convert to event code format if needed (0/1 -> 192/191)
                     if attention_label in [0, 1]:
                         attention_label = 192 if attention_label == 0 else 191
                 
                 # Method 2: Use event code from trial_event_mapping (for segmented continuous data)
-                elif trial_idx in trial_event_mapping:
-                    event_code = trial_event_mapping[trial_idx]
+                elif orig_trial_idx in trial_event_mapping:
+                    event_code = trial_event_mapping[orig_trial_idx]
                     # Only use if it's an attention code (191 or 192)
                     if event_code in [191, 192]:
                         attention_label = event_code
@@ -1423,11 +1544,11 @@ class FuglsangDatasetMWF:
                         event_values = event_values.flatten()
                     # Filter to only attention codes
                     attention_event_values = [v for v in event_values if v in [191, 192]]
-                    if len(attention_event_values) > 0 and trial_idx < len(attention_event_values):
-                        attention_label = attention_event_values[trial_idx]
-                    elif len(event_values) > 0 and trial_idx < len(event_values):
+                    if len(attention_event_values) > 0 and orig_trial_idx < len(attention_event_values):
+                        attention_label = attention_event_values[orig_trial_idx]
+                    elif len(event_values) > 0 and orig_trial_idx < len(event_values):
                         # Check if the event value at this index is an attention code
-                        event_val = event_values[trial_idx]
+                        event_val = event_values[orig_trial_idx]
                         if event_val in [191, 192]:
                             attention_label = event_val
                 
@@ -1438,21 +1559,22 @@ class FuglsangDatasetMWF:
                     try:
                         if hasattr(expinfo, 'wavfile_male'):
                             male_files = expinfo.wavfile_male
-                            if isinstance(male_files, (list, np.ndarray)) and trial_idx < len(male_files):
-                                audio_file_male = str(male_files[trial_idx]) if len(male_files) > trial_idx else None
+                            if isinstance(male_files, (list, np.ndarray)) and used_trial_idx < len(male_files):
+                                audio_file_male = str(male_files[used_trial_idx]) if len(male_files) > used_trial_idx else None
                         if hasattr(expinfo, 'wavfile_female'):
                             female_files = expinfo.wavfile_female
-                            if isinstance(female_files, (list, np.ndarray)) and trial_idx < len(female_files):
-                                audio_file_female = str(female_files[trial_idx]) if len(female_files) > trial_idx else None
+                            if isinstance(female_files, (list, np.ndarray)) and used_trial_idx < len(female_files):
+                                audio_file_female = str(female_files[used_trial_idx]) if len(female_files) > used_trial_idx else None
                     except Exception as e:
-                        logger.debug(f"Could not extract audio file info for trial {trial_idx}: {e}")
+                        logger.debug(f"Could not extract audio file info for trial {used_trial_idx}: {e}")
                 
                 processed_trial = {
                     'eeg_data': cleaned_eeg,
                     'sample_rate': self.target_sampling_rate,  # After downsampling
                     'original_sample_rate': fsample,
                     'attention_label': attention_label,
-                    'trial_idx': trial_idx,
+                    'trial_idx': used_trial_idx,
+                    'original_trial_idx': orig_trial_idx,
                     'subject_id': subject_id,
                     'original_shape': eeg_data.shape,
                     'cleaned_shape': cleaned_eeg.shape,
@@ -1463,10 +1585,10 @@ class FuglsangDatasetMWF:
                 processed_trials.append(processed_trial)
                 
             except Exception as e:
-                logger.error(f"Error processing trial {trial_idx}: {e}")
+                logger.error(f"Error processing trial {orig_trial_idx}: {e}")
                 continue
         
-        logger.info(f"Processed {len(processed_trials)}/{len(eeg_trials)} trials for subject {subject_id}")
+        logger.info(f"Processed {len(processed_trials)}/{len(trial_indices_to_use)} trials for subject {subject_id}")
         
         return {
             'subject_id': subject_id,
@@ -1485,6 +1607,26 @@ class FuglsangDatasetMWF:
             'n_trials': processed_data['n_trials'],
             'trials': []
         }
+        # Save expinfo (attend_mf, attend_lr) so CombinedDataset can use it for left/right envelope assignment
+        expinfo = processed_data.get('expinfo')
+        if expinfo is not None:
+            expinfo_save = {}
+            try:
+                if hasattr(expinfo, 'attend_mf'):
+                    v = expinfo.attend_mf
+                    expinfo_save['attend_mf'] = np.atleast_1d(np.asarray(v).flatten())
+                if hasattr(expinfo, 'attend_lr'):
+                    v = expinfo.attend_lr
+                    expinfo_save['attend_lr'] = np.atleast_1d(np.asarray(v).flatten())
+                if isinstance(expinfo, dict):
+                    if 'attend_mf' in expinfo:
+                        expinfo_save['attend_mf'] = np.atleast_1d(np.asarray(expinfo['attend_mf']).flatten())
+                    if 'attend_lr' in expinfo:
+                        expinfo_save['attend_lr'] = np.atleast_1d(np.asarray(expinfo['attend_lr']).flatten())
+                if expinfo_save:
+                    save_dict['expinfo'] = expinfo_save
+            except Exception as e:
+                logger.warning(f"Could not save expinfo to MWF file: {e}")
         
         for trial in processed_data['trials']:
             trial_dict = {
@@ -1808,6 +1950,10 @@ def main():
                        help='Fuglsang EEG directory')
     parser.add_argument('--fuglsang_audio_dir', type=str, default='Data/Fulsang/AUDIO',
                        help='Fuglsang audio directory')
+    parser.add_argument('--no_truncate_to_sidecar_labels', dest='truncate_to_sidecar_labels', action='store_false', default=True,
+                       help='Disable truncation when EEG trials != expinfo label count (default: truncate to match labels).')
+    parser.add_argument('--no_force_segment_from_events', dest='force_segment_from_events', action='store_false', default=True,
+                       help='Allow using pre-segmented trials if present (default: always segment continuous EEG from data.event.eeg).')
     parser.add_argument('--dataset', type=str, choices=['das', 'fuglsang', 'both'], default='both',
                        help='Which dataset to process')
     parser.add_argument('--visualize', action='store_true',
@@ -1852,7 +1998,9 @@ def main():
             fuglsang_processor = FuglsangDatasetMWF(
                 eeg_base_path=args.fuglsang_eeg_dir,
                 audio_base_path=args.fuglsang_audio_dir,
-                output_dir='MWF_cleaned_Fuglsang'
+                output_dir='MWF_cleaned_Fuglsang',
+                truncate_to_sidecar_labels=getattr(args, 'truncate_to_sidecar_labels', True),
+                force_segment_from_events=getattr(args, 'force_segment_from_events', True)
             )
             fuglsang_results = fuglsang_processor.process_all_subjects()
             logger.info(f"Fuglsang dataset: {len(fuglsang_results)} subjects processed")

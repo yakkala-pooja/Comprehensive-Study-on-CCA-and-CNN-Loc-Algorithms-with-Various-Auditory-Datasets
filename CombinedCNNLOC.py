@@ -8,6 +8,7 @@ combined dataset using the FULCNN architecture, adapted for CombinedDataset.
 
 import os
 import sys
+import subprocess
 import numpy as np
 import torch
 import torch.nn as nn
@@ -35,6 +36,10 @@ from CombinedDataset import CombinedDataset
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
+
+# ============================================================================
+# FULCNN Architecture Components (extracted from FULCNN.py)
+# ============================================================================
 
 class SpatialTemporalAttention(nn.Module):
     """Channel attention for EEG data."""
@@ -171,6 +176,7 @@ class CNNLOCBackbone(nn.Module):
     
     def _calculate_output_size(self):
         """Figure out output size by running a dummy input."""
+        # Use CPU for shape calculation (device-agnostic)
         dummy_input = torch.randn(1, self.input_channels, self.input_time, self.input_freq)
         
         with torch.no_grad():
@@ -216,15 +222,15 @@ class CNNLOCModel(nn.Module):
         # Create backbone
         self.backbone = CNNLOCBackbone(input_channels, input_time, input_freq)
         
-        # Classifier
+        # Classifier - using LayerNorm instead of BatchNorm for stability with small batches
         self.classifier = nn.Sequential(
             nn.Dropout(dropout_rate),
             nn.Linear(self.backbone.output_size, 128),
-            nn.BatchNorm1d(128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(dropout_rate * 0.5),
             nn.Linear(128, 32),
-            nn.BatchNorm1d(32),
+            nn.LayerNorm(32),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
             nn.Linear(32, num_classes)
@@ -273,8 +279,12 @@ class CombinedCNNLOCDataset(Dataset):
         self.sampling_rate = combined_dataset.sampling_rate
         self.n_channels = combined_dataset.n_channels
         
-        # Get window indices
+        # Get window indices (now includes grouping info: start, end, label, subject_id, trial_idx, dataset)
         self.window_indices = combined_dataset.get_window_indices()
+        
+        # Extract grouping info for potential group-based splitting
+        # Format: (start_idx, end_idx, label, subject_id, trial_idx, dataset)
+        self.window_groups = [(meta[3], meta[4], meta[5]) for meta in self.window_indices] if len(self.window_indices) > 0 and len(self.window_indices[0]) > 3 else None
         
         print(f"\nCombinedCNNLOCDataset initialized:")
         print(f"  Mode: {mode}")
@@ -283,6 +293,10 @@ class CombinedCNNLOCDataset(Dataset):
         print(f"  Sampling rate: {self.sampling_rate} Hz")
         print(f"  Channels: {self.n_channels}")
         print(f"  Transform EEG: {transform_eeg}")
+        if self.window_groups:
+            unique_groups = len(set(self.window_groups))
+            print(f"  Unique groups (subject+trial+dataset): {unique_groups}")
+            print(f"  Note: Use group-based splitting to prevent data leakage from overlapping windows")
     
     def _transform_eeg(self, eeg_window: np.ndarray) -> np.ndarray:
         """Transform EEG window to time-frequency representation (FULCNN format)."""
@@ -356,7 +370,9 @@ class CombinedCNNLOCDataset(Dataset):
         return len(self.window_indices)
     
     def __getitem__(self, idx):
-        start_idx, end_idx, label = self.window_indices[idx]
+        # Window indices format: (start_idx, end_idx, label, subject_id, trial_idx, dataset)
+        window_info = self.window_indices[idx]
+        start_idx, end_idx, label = window_info[0], window_info[1], window_info[2]
         
         # Extract window
         eeg_window = self.combined_dataset.eeg_data[start_idx:end_idx]
@@ -374,16 +390,25 @@ class CombinedCNNLOCDataset(Dataset):
             # Simple reshape
             eeg_tf = eeg_window.T[:, :, np.newaxis]
         
-        # Convert to tensors
+        # Convert to tensors - return scalar label to avoid squeeze issues
         eeg_tensor = torch.FloatTensor(eeg_tf)
-        label_tensor = torch.LongTensor([label])
+        label_tensor = torch.tensor(label, dtype=torch.long)  # scalar, not array
         
         return eeg_tensor, label_tensor
 
 
 def split_dataset(dataset: CombinedCNNLOCDataset, train_ratio: float = 0.7, 
                   val_ratio: float = 0.15) -> Tuple[Dataset, Dataset, Dataset]:
-    """Split dataset into train/val/test sets."""
+    """
+    Split dataset into train/val/test sets.
+    
+    WARNING: This uses random window-level splitting which can cause data leakage
+    when windows overlap (default overlap=0.5). Overlapping windows from the same
+    continuous recording will appear in both train and test sets, inflating accuracy.
+    
+    For proper subject-level splitting without leakage, use CombinedCNNLOCSub.py
+    or implement a split that groups windows by subject/trial before splitting.
+    """
     total_size = len(dataset)
     train_size = int(train_ratio * total_size)
     val_size = int(val_ratio * total_size)
@@ -410,7 +435,7 @@ class CNNLOCTrainer:
         self.best_model_path = self.output_dir / "best_model.pth"
     
     def train_epoch(self, train_loader: DataLoader, optimizer: optim.Optimizer, 
-                   criterion: nn.Module) -> Tuple[float, float]:
+                   criterion: nn.Module, scheduler: Optional[optim.lr_scheduler._LRScheduler] = None) -> Tuple[float, float]:
         """Train for one epoch."""
         self.model.train()
         total_loss = 0.0
@@ -419,7 +444,8 @@ class CNNLOCTrainer:
         
         for batch_idx, (data, target) in enumerate(tqdm(train_loader, desc="Training")):
             data, target = data.to(self.device), target.to(self.device)
-            target = target.squeeze()
+            # Ensure target is always shape (batch,) - handle scalar labels safely
+            target = target.long().view(-1)
             
             # Forward
             output = self.model(data)
@@ -430,6 +456,10 @@ class CNNLOCTrainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             optimizer.step()
+            
+            # Step scheduler per batch (for OneCycleLR)
+            if scheduler is not None:
+                scheduler.step()
             
             # Accumulate loss and accuracy
             total_loss += loss.item()
@@ -455,7 +485,8 @@ class CNNLOCTrainer:
         with torch.no_grad():
             for data, target in tqdm(val_loader, desc="Validation"):
                 data, target = data.to(self.device), target.to(self.device)
-                target = target.squeeze()
+                # Ensure target is always shape (batch,) - handle scalar labels safely
+                target = target.long().view(-1)
                 
                 output = self.model(data)
                 loss = criterion(output, target)
@@ -480,6 +511,7 @@ class CNNLOCTrainer:
         
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        # OneCycleLR steps per batch, not per epoch
         scheduler = OneCycleLR(optimizer, max_lr=learning_rate * 5, 
                               total_steps=num_epochs * len(train_loader), pct_start=0.3)
         
@@ -489,10 +521,9 @@ class CNNLOCTrainer:
             print(f"\nEpoch {epoch+1}/{num_epochs}")
             print("-" * 50)
             
-            train_loss, train_acc = self.train_epoch(train_loader, optimizer, criterion)
+            # Pass scheduler to train_epoch so it steps per batch
+            train_loss, train_acc = self.train_epoch(train_loader, optimizer, criterion, scheduler)
             val_loss, val_acc = self.validate_epoch(val_loader, criterion)
-            
-            scheduler.step()
             
             print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
             print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
@@ -530,7 +561,8 @@ class CNNLOCTrainer:
         with torch.no_grad():
             for data, target in tqdm(test_loader, desc="Testing"):
                 data, target = data.to(self.device), target.to(self.device)
-                target = target.squeeze()
+                # Ensure target is always shape (batch,) - handle scalar labels safely
+                target = target.long().view(-1)
                 
                 output = self.model(data)
                 probabilities = F.softmax(output, dim=1)
@@ -546,7 +578,12 @@ class CNNLOCTrainer:
         probs = np.array(all_probabilities)
         
         accuracy = accuracy_score(targets, preds)
-        roc_auc = roc_auc_score(targets, probs)
+        # ROC-AUC requires both classes to be present
+        roc_auc = None
+        if len(np.unique(targets)) == 2:
+            roc_auc = roc_auc_score(targets, probs)
+        else:
+            print(f"Warning: Test set contains only {len(np.unique(targets))} class(es). ROC-AUC cannot be computed.")
         
         results = {
             'accuracy': accuracy,
@@ -565,11 +602,17 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Combined Das+Fulsang CNN-LOC using FULCNN architecture')
-    parser.add_argument('--das_data_dir', type=str, default='das_16subjects_preprocessed',
+    parser.add_argument('--das_data_dir', type=str, default='das_combined_preprocessed',
                        help='Directory containing Das preprocessed data')
-    parser.add_argument('--das_preprocessing_type', type=str, default='16SUBJECTS',
-                       choices=['MWF', 'DASPREPROCESS', '16SUBJECTS'],
-                       help='Type of Das preprocessing')
+    parser.add_argument('--das_original_dir', type=str, default='Data/Das/4004271',
+                       help='Directory containing original DAS .mat files (for auto preprocessing)')
+    parser.add_argument('--das_audio_dir', type=str, default='Data/Das/4004271/stimuli/stimuli',
+                       help='Directory containing DAS audio files (for auto preprocessing)')
+    parser.add_argument('--no_auto_das_preprocess', action='store_true',
+                       help='Do not run das_preprocessing_combined.py automatically when TFRecords are missing')
+    parser.add_argument('--das_preprocessing_type', type=str, default='COMBINED_DAS',
+                       choices=['COMBINED_DAS', '16SUBJECTS', 'MWF', 'DASPREPROCESS'],
+                       help='Type of Das preprocessing (16SUBJECTS is alias for COMBINED_DAS)')
     parser.add_argument('--fulsang_raw_dir', type=str, 
                        default='/home/py9363/telluride_decoding/Data/Fulsang/EEG',
                        help='Directory containing Fulsang raw EEG data')
@@ -598,7 +641,11 @@ def main():
                        help='Output directory for results')
     
     args = parser.parse_args()
-    
+    # Normalize alias: 16SUBJECTS -> COMBINED_DAS (same pipeline)
+    if args.das_preprocessing_type == '16SUBJECTS':
+        args.das_preprocessing_type = 'COMBINED_DAS'
+        print("Using combined Das (16SUBJECTS -> COMBINED_DAS)")
+
     print("="*80)
     print("COMBINED CNN-LOC - Das (MWF) + Fulsang (MWF) CNN-LOC Training")
     print("="*80)
@@ -608,6 +655,47 @@ def main():
     print(f"  Learning rate: {args.learning_rate}")
     print(f"  Epochs: {args.num_epochs}")
     
+    # Pre-check: COMBINED_DAS requires das_combined_preprocessed/tfrecords. Run preprocessing by default if missing.
+    if args.das_preprocessing_type == "COMBINED_DAS":
+        tfrecord_dir = Path(args.das_data_dir) / "tfrecords"
+        tfrecord_files = list(tfrecord_dir.glob("*.tfrecords")) or list(tfrecord_dir.glob("*/*.tfrecords")) if tfrecord_dir.exists() else []
+        if not tfrecord_files and not args.no_auto_das_preprocess:
+            script_dir = Path(__file__).resolve().parent
+            preprocess_script = script_dir / "das_preprocessing_combined.py"
+            if preprocess_script.exists():
+                print("\n" + "="*80)
+                print("DAS combined TFRecords not found - running das_preprocessing_combined.py by default")
+                print("="*80)
+                cmd = [
+                    sys.executable, str(preprocess_script),
+                    "--data_dir", args.das_original_dir,
+                    "--output_dir", args.das_data_dir,
+                    "--audio_dir", args.das_audio_dir,
+                ]
+                ret = subprocess.run(cmd, cwd=str(script_dir))
+                if ret.returncode != 0:
+                    print(f"\nPreprocessing exited with code {ret.returncode}. Fix errors above or run manually: python das_preprocessing_combined.py")
+                    sys.exit(ret.returncode)
+                tfrecord_dir = Path(args.das_data_dir) / "tfrecords"
+                tfrecord_files = list(tfrecord_dir.glob("*.tfrecords")) or list(tfrecord_dir.glob("*/*.tfrecords"))
+        if not tfrecord_dir.exists():
+            print("\n" + "="*80)
+            print("ERROR: DAS combined TFRecord directory not found")
+            print("="*80)
+            print(f"  Directory: {tfrecord_dir.resolve()}")
+            print("\n  Run: python das_preprocessing_combined.py")
+            print("  Or ensure DAS .mat files (S*.mat) exist in:", args.das_original_dir)
+            print("="*80)
+            sys.exit(1)
+        if not tfrecord_files:
+            print("\n" + "="*80)
+            print("ERROR: No TFRecord files in DAS combined directory")
+            print("="*80)
+            print(f"  Directory: {tfrecord_dir.resolve()}")
+            print("  Run: python das_preprocessing_combined.py")
+            print("="*80)
+            sys.exit(1)
+
     # Create combined dataset
     print("\n" + "="*80)
     print("LOADING COMBINED DATASET")
@@ -615,8 +703,8 @@ def main():
     combined_dataset = CombinedDataset(
         das_data_dir=args.das_data_dir,
         das_preprocessing_type=args.das_preprocessing_type,
-        das_original_dir=getattr(args, 'das_original_dir', 'Data/Das/4004271'),
-        das_audio_dir=getattr(args, 'das_audio_dir', 'Data/Das/4004271/stimuli/stimuli'),
+        das_original_dir=args.das_original_dir,
+        das_audio_dir=args.das_audio_dir,
         fulsang_raw_dir=args.fulsang_raw_dir,
         fulsang_audio_dir=args.fulsang_audio_dir,
         fulsang_mwf_output_dir=args.fulsang_mwf_dir,
@@ -648,10 +736,13 @@ def main():
         print("Using window-level split for now")
         train_dataset, val_dataset, test_dataset = split_dataset(pytorch_dataset)
     
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    # Create data loaders - drop_last=True for training to avoid BatchNorm issues with batch_size=1
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
+                             num_workers=2, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
+                           num_workers=2, drop_last=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, 
+                             num_workers=2, drop_last=False)
     
     print(f"  Train samples: {len(train_dataset)}")
     print(f"  Val samples: {len(val_dataset)}")
@@ -696,7 +787,7 @@ def main():
     # Save results
     results_json = {
         'accuracy': float(test_metrics['accuracy']),
-        'roc_auc': float(test_metrics['roc_auc']),
+        'roc_auc': float(test_metrics['roc_auc']) if test_metrics['roc_auc'] is not None else None,
         'best_val_acc': float(test_metrics['best_val_acc']),
         'timestamp': datetime.now().isoformat()
     }
@@ -706,7 +797,10 @@ def main():
     
     print(f"\n✓ Training Complete")
     print(f"  Test Accuracy: {test_metrics['accuracy']:.4f}")
-    print(f"  Test ROC-AUC: {test_metrics['roc_auc']:.4f}")
+    if test_metrics['roc_auc'] is not None:
+        print(f"  Test ROC-AUC: {test_metrics['roc_auc']:.4f}")
+    else:
+        print(f"  Test ROC-AUC: N/A (only one class in test set)")
     print(f"\n✓ Results saved to {args.output_dir}")
 
 

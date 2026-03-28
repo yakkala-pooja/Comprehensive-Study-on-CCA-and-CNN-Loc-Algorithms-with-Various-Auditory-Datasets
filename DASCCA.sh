@@ -102,22 +102,18 @@ echo "=========================================="
 
 # Configuration 1: Standard CCA with Backward/Forward Model
 # Audio loading ENABLED for proper CCA performance
-# Using --max_files 100 for faster testing (remove for full dataset)
-# Backward model: time-lagging on EEG (5 past samples)
-# Forward model: causal audio filtering (enforced by data alignment)
-# PCA: Optional regularization (disabled by default, set --pca_components to enable)
+# Full dataset (no max_files limit). Window 8s (1024 samples at 128 Hz).
 # LDA: Enabled by default for better classification
 echo "Running Standard CCA Configuration with Backward/Forward Model..."
 python DASCCA.py \
     --tfrecord_dir das_16subjects_preprocessed/tfrecords \
     --batch_size 16 \
-    --cca_dims 4 \
-    --regularization 0.01 \
-    --window_size 512 \
+    --cca_dims 40 \
+    --regularization 0.08 \
+    --window_size 1024 \
     --output_dir dascca_results/standard_cca \
     --load_audio \
     --audio_base_dir /home/py9363/telluride_decoding/Data/Das/4004271/stimuli/stimuli \
-    --max_files 100 \
     --eeg_lag_samples 5 \
     --use_lda
 

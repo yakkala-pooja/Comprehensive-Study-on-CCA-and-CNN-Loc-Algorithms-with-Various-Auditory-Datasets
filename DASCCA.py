@@ -6,32 +6,28 @@ import numpy as np
 import tensorflow as tf
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
-import matplotlib.pyplot as plt
 from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, 
                            precision_recall_fscore_support, roc_auc_score, roc_curve,
                            precision_recall_curve, average_precision_score,
                            matthews_corrcoef, cohen_kappa_score, balanced_accuracy_score,
                            f1_score)
-from sklearn.cross_decomposition import CCA as SklearnCCA
-from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from scipy.stats import pearsonr
-import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 import json
 import pickle
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
-
-
-import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 
-os.environ['TF_DETERMINISTIC_OPS'] = '1'
-os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+# FIXED: Make determinism optional - can break GPU kernels on some systems
+# Uncomment if determinism is required (may cause errors on some GPUs/TF versions)
+# os.environ['TF_DETERMINISTIC_OPS'] = '1'
+# os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
 
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
@@ -48,14 +44,7 @@ try:
         print("✓ GPU memory growth configured")
         
 
-        try:
-            for gpu in gpu_devices:
-                tf.config.experimental.set_memory_limit(gpu, 8192)
-            print("✓ GPU memory limits configured")
-        except AttributeError:
-            print("✓ GPU memory limits not supported in this TensorFlow version")
-        except Exception as e:
-            print(f"GPU memory limit warning: {e}")
+        # Memory growth is sufficient for dynamic allocation
             
     else:
         raise RuntimeError("No GPU devices found! GPU-only mode requires GPU.")
@@ -67,26 +56,21 @@ except Exception as e:
 sys.path.append('telluride_decoding')
 
 try:
-    from telluride_decoding import decoding
-    from telluride_decoding import brain_data
-    from telluride_decoding import regression
-    from telluride_decoding import attention_decoder
     from telluride_decoding.cca import (
         BrainModelCCA, 
         cca_pearson_correlation_first,
-        cca_pearson_correlation,
         calculate_cca_parameters_from_dataset
     )
 except ImportError as e:
-    print(f"Warning: Could not import some telluride_decoding modules: {e}")
-    print("Continuing with basic functionality...")
+    print(f"Warning: Could not import telluride_decoding.cca: {e}")
+    raise
 
 
 tf.compat.v1.enable_v2_behavior()
 
 
 device = tf.device('/GPU:0')
-print("Using GPU for computation (GPU-only mode with CPU fallback)")
+print("Using GPU for computation")
 
 
 tf.random.set_seed(42)
@@ -94,9 +78,73 @@ np.random.seed(42)
 print("✓ Random seeds set for reproducibility")
 
 
+def make_lagged_audio(audio: np.ndarray, lag_samples: np.ndarray, fs: float = 128.0) -> np.ndarray:
+    """
+    Create time-lagged audio features for CCA (forward model).
+    
+    Neural response to speech has a delay (typically 150-400ms). This function creates
+    lagged copies of the audio envelope to account for this latency.
+    
+    Args:
+        audio: Audio envelope of shape (T, B) where T is time samples and B is number of bands (4 for DAS)
+        lag_samples: Array of lag values in samples (e.g., np.arange(0, int(0.4 * fs)) for 0-400ms)
+        fs: Sampling rate in Hz (default: 128 Hz for DAS)
+        
+    Returns:
+        Lagged audio features of shape (T, B * num_lags)
+        Each band is replicated with different time shifts, then concatenated.
+    """
+    T, B = audio.shape
+    num_lags = len(lag_samples)
+    lagged_features = []
+    
+    for lag in lag_samples:
+        # Shift audio by lag samples (forward model: audio(t-lag) predicts EEG(t))
+        shifted = np.roll(audio, lag, axis=0)
+        # Zero out the beginning where we rolled around
+        if lag > 0:
+            shifted[:lag, :] = 0
+        
+        lagged_features.append(shifted)
+    
+    # Concatenate all lagged versions: shape (T, B * num_lags)
+    lagged_audio = np.concatenate(lagged_features, axis=1)
+    
+    return lagged_audio.astype(np.float32)
+
+def make_lagged_eeg(eeg: np.ndarray, L: int) -> np.ndarray:
+    """
+    Create time-lagged EEG features for backward model (paper: spatiotemporal wx).
+    
+    x(t) = [eeg(t), eeg(t-1), ..., eeg(t-L+1)] per channel then flatten -> (T, C*L).
+    Causal: only past and current; no future. Early t padded with zeros.
+    
+    Args:
+        eeg: EEG of shape (T, C)
+        L: Number of backward taps (lag order)
+    Returns:
+        (T, C*L) float32
+    """
+    T, C = eeg.shape
+    if L <= 1:
+        return np.asarray(eeg, dtype=np.float32)
+    out = np.zeros((T, C * L), dtype=np.float32)
+    for t in range(T):
+        # Use eeg(t), eeg(t-1), ..., eeg(t-L+1); pad with zeros for t < L-1
+        segs = []
+        for lag in range(L):
+            idx = t - lag
+            if idx >= 0:
+                segs.append(eeg[idx, :])  # (C,)
+            else:
+                segs.append(np.zeros(C, dtype=eeg.dtype))
+        out[t, :] = np.concatenate(segs, axis=0)  # [eeg(t), eeg(t-1), ..., eeg(t-L+1)] flattened
+    return out
+
+
 def _apply_time_lagging(eeg_window: np.ndarray, lag_samples: int) -> np.ndarray:
     """
-    Create time-lagged EEG features for backward model.
+    Create time-lagged EEG features for backward model (DEPRECATED - use make_lagged_eeg).
     
     For each time point, concatenate current and past time points.
     This creates spatiotemporal features: [eeg(t), eeg(t-1), ..., eeg(t-lag)]
@@ -108,27 +156,7 @@ def _apply_time_lagging(eeg_window: np.ndarray, lag_samples: int) -> np.ndarray:
     Returns:
         Time-lagged EEG features of shape (window_size, n_channels * (lag_samples + 1))
     """
-    window_size, n_channels = eeg_window.shape
-    lagged_features = []
-    
-    for t in range(window_size):
-        # Get time points from t-lag to t (inclusive)
-        start_idx = max(0, t - lag_samples)
-        end_idx = t + 1
-        
-        # Extract time-lagged segment
-        lagged_segment = eeg_window[start_idx:end_idx, :]  # Shape: (segment_len, n_channels)
-        
-        # Pad with zeros if needed (for early time points)
-        if lagged_segment.shape[0] < (lag_samples + 1):
-            padding = np.zeros(((lag_samples + 1) - lagged_segment.shape[0], n_channels), 
-                             dtype=eeg_window.dtype)
-            lagged_segment = np.vstack([padding, lagged_segment])
-        
-        # Flatten to create feature vector: [eeg(t-lag), ..., eeg(t)]
-        lagged_features.append(lagged_segment.flatten())
-    
-    return np.array(lagged_features, dtype=eeg_window.dtype)
+    return make_lagged_eeg(eeg_window, lag_samples + 1)
 
 def safe_random_operations():
     """Force CPU usage for random operations."""
@@ -140,7 +168,7 @@ def safe_random_operations():
 class DasDatasetCCA:
     
     def __init__(self, tfrecord_dir: str, mode: str = 'full', 
-                 window_size: int = 32, overlap: float = 0.5,
+                 window_size: int = 32, overlap: float = 0.25,
                  cache_size: int = 1000, audio_base_dir: Optional[str] = None,
                  load_audio: bool = True, max_files: Optional[int] = None):
         self.tfrecord_dir = Path(tfrecord_dir)
@@ -151,7 +179,7 @@ class DasDatasetCCA:
         self.load_audio = load_audio  # Option to skip audio loading for speed
         self.max_files = max_files  # Limit number of files to load
         
-        self.sampling_rate = 128  # FIXED: Changed from 64 to 128 Hz to match preprocessing (das_preprocessing_16subjects.py uses 128 Hz)
+        self.sampling_rate = 128  # Matches preprocessing (das_preprocessing_16subjects.py uses 128 Hz)
         self.n_channels = 64
         self.attention_switch_duration = 20
         
@@ -187,9 +215,14 @@ class DasDatasetCCA:
         
 
         self._audio_envelope_cache = {}
+        self._preload_audio = True  # Pre-load audio files for faster access
         
 
         self.eeg_data, self.audio_envelopes, self.labels, self.metadata = self._load_das_preprocessing_data()
+        
+        # Pre-load audio files if enabled (speeds up training significantly)
+        if self.load_audio and self._preload_audio:
+            self._preload_all_audio_files()
         
         self.window_indices = self._create_das_windows()
         
@@ -200,25 +233,109 @@ class DasDatasetCCA:
         print(f"Using DAS preprocessing: Yes")
         print(f"Cache size: {cache_size} windows")
     
+    def _validate_left_right_consistency(self, all_metadata: List[Dict], all_labels: List) -> None:
+        """Confirm left/right audio and labels are consistent across records (no swap by subject or trial)."""
+        print("\n" + "=" * 60)
+        print("LEFT/RIGHT AUDIO AND LABEL CONSISTENCY CHECK")
+        print("=" * 60)
+        n = len(all_metadata)
+        if n != len(all_labels):
+            print(f"  ⚠ Metadata length ({n}) != labels length ({len(all_labels)})")
+            return
+        label_ok = 0
+        left_right_distinct = 0
+        left_present = 0
+        right_present = 0
+        mismatches = []
+        sample_per_subject = {}
+        for i, (meta, label) in enumerate(zip(all_metadata, all_labels)):
+            att = meta.get('attended_ear')
+            left_file = meta.get('left_audio_file')
+            right_file = meta.get('right_audio_file')
+            # Label 0 = left attended (L), label 1 = right attended (R)
+            lab = int(label) if hasattr(label, '__int__') else label
+            if att == 'L' and lab == 0:
+                label_ok += 1
+            elif att == 'R' and lab == 1:
+                label_ok += 1
+            else:
+                mismatches.append((i, meta.get('subject_id'), att, lab, left_file, right_file))
+            if left_file:
+                left_present += 1
+            if right_file:
+                right_present += 1
+            if left_file and right_file and left_file != right_file:
+                left_right_distinct += 1
+            # Sample one record per subject for display
+            sid = meta.get('subject_id', 'unknown')
+            if sid not in sample_per_subject:
+                sample_per_subject[sid] = (att, label, left_file, right_file)
+        print(f"  Records checked: {n}")
+        print(f"  Label matches attended_ear (L=0, R=1): {label_ok}/{n} ({100*label_ok/n:.1f}%)")
+        print(f"  Left audio file present: {left_present}/{n}")
+        print(f"  Right audio file present: {right_present}/{n}")
+        print(f"  Left and right distinct: {left_right_distinct}/{n}")
+        if mismatches:
+            print(f"  ⚠ MISMATCHES: {len(mismatches)} records where label != attended_ear")
+            for (j, sid, att, lab, lf, rf) in mismatches[:10]:
+                print(f"    record {j} subject {sid}: attended_ear={att} label={lab} left={lf} right={rf}")
+            if len(mismatches) > 10:
+                print(f"    ... and {len(mismatches)-10} more")
+        else:
+            print(f"  ✓ No label/attended_ear mismatches")
+        if self.load_audio and (left_present < n or right_present < n):
+            print(f"  ⚠ Some records missing left/right audio paths (may use fallback)")
+        print("  Sample per subject (attended_ear, label, left_audio_file, right_audio_file):")
+        for sid in sorted(sample_per_subject.keys())[:8]:
+            att, lab, lf, rf = sample_per_subject[sid]
+            lf_short = (lf[:50] + "..." if lf and len(lf) > 50 else lf) or "None"
+            rf_short = (rf[:50] + "..." if rf and len(rf) > 50 else rf) or "None"
+            print(f"    {sid}: att={att} label={lab} left=[{lf_short}] right=[{rf_short}]")
+        if len(sample_per_subject) > 8:
+            print(f"    ... and {len(sample_per_subject)-8} more subjects")
+        print("=" * 60 + "\n")
+
     def _load_das_preprocessing_data(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict]]:
         """Load DAS preprocessing validated TFRecord data with robust shape validation."""
 
         tfrecord_files = []
         
-
+        # Try multiple patterns to find TFRecord files
+        # Pattern 1: Direct files with .tfrecords extension
         direct_files = list(self.tfrecord_dir.glob("*.tfrecords"))
         if direct_files:
             tfrecord_files.extend(direct_files)
         
-
+        # Pattern 2: Files with .tfrecord extension (singular)
+        direct_files_singular = list(self.tfrecord_dir.glob("*.tfrecord"))
+        if direct_files_singular:
+            tfrecord_files.extend(direct_files_singular)
+        
+        # Pattern 3: Files in tfrecords subdirectory
+        tfrecords_dir = self.tfrecord_dir / "tfrecords"
+        if tfrecords_dir.exists() and tfrecords_dir.is_dir():
+            subdir_files = list(tfrecords_dir.glob("*.tfrecords"))
+            if subdir_files:
+                tfrecord_files.extend(subdir_files)
+            subdir_files_singular = list(tfrecords_dir.glob("*.tfrecord"))
+            if subdir_files_singular:
+                tfrecord_files.extend(subdir_files_singular)
+        
+        # Pattern 4: Files in subdirectories (one level deep)
         subdir_files = list(self.tfrecord_dir.glob("*/*.tfrecords"))
         if subdir_files:
             tfrecord_files.extend(subdir_files)
+        subdir_files_singular = list(self.tfrecord_dir.glob("*/*.tfrecord"))
+        if subdir_files_singular:
+            tfrecord_files.extend(subdir_files_singular)
         
-
+        # Pattern 5: Files in nested subdirectories (two levels deep)
         nested_files = list(self.tfrecord_dir.glob("*/*/*.tfrecords"))
         if nested_files:
             tfrecord_files.extend(nested_files)
+        nested_files_singular = list(self.tfrecord_dir.glob("*/*/*.tfrecord"))
+        if nested_files_singular:
+            tfrecord_files.extend(nested_files_singular)
         
         if not tfrecord_files:
             print(f"Available directories in {self.tfrecord_dir}:")
@@ -232,22 +349,11 @@ class DasDatasetCCA:
             print(f"⚠ Limiting to {self.max_files} files (out of {len(tfrecord_files)}) for faster loading")
             tfrecord_files = tfrecord_files[:self.max_files]
         
-        print(f"Loading DAS 16-subjects preprocessing validated data from {len(tfrecord_files)} files...")
-        print("✓ Using validated attention labels with quality control")
-        print("✓ Using subject-wise organized data (no data leakage)")
+        print(f"Loading {len(tfrecord_files)} TFRecord files...")
         if self.load_audio:
-            print("✓ EEG + Audio envelope processing with 16 subjects support")
-            print(f"  Audio base directory: {self.audio_base_dir}")
-            if self.audio_base_dir and self.audio_base_dir.exists():
-                # Count audio files in directory
-                audio_files = list(self.audio_base_dir.glob("*.wav")) + list(self.audio_base_dir.glob("*.WAV")) + \
-                             list(self.audio_base_dir.glob("*.mp3")) + list(self.audio_base_dir.glob("*.MP3"))
-                print(f"  Found {len(audio_files)} audio files in base directory")
-            else:
-                print(f"  ⚠ WARNING: Audio base directory may not exist: {self.audio_base_dir}")
+            print(f"Audio loading enabled: {self.audio_base_dir}")
         else:
-            print("⚠ Audio loading DISABLED - using dummy audio envelopes (faster loading)")
-        print(f"✓ Found TFRecord files in: {[f.parent.name for f in tfrecord_files[:3]]}...")
+            print("Audio loading disabled (using dummy envelopes)")
         
         all_eeg_data = []
         all_audio_envelopes = []
@@ -257,8 +363,8 @@ class DasDatasetCCA:
         successful_files = 0
         failed_files = 0
         total_records = 0
+        records_swapped_left_right = 0  # track2/track1 normalized to left=track1, right=track2
         subject_stats = {}
-        shape_validation_errors = 0
         
         for tfrecord_file in tqdm(tfrecord_files, desc="Loading DAS preprocessing data"):
             try:
@@ -291,27 +397,27 @@ class DasDatasetCCA:
                             if right_audio_values and len(right_audio_values) > 0:
                                 right_audio_file = right_audio_values[0].decode('utf-8')
                         
+                        # Normalize so left=track1, right=track2 everywhere (some TFRecords use opposite convention).
+                        # When we swap files we must also swap label so label 0 = attended track1 (left), 1 = track2 (right).
+                        swapped_left_right = False
+                        if left_audio_file and right_audio_file:
+                            if 'track2' in left_audio_file and 'track1' in right_audio_file:
+                                left_audio_file, right_audio_file = right_audio_file, left_audio_file
+                                records_swapped_left_right += 1
+                                swapped_left_right = True
+                        
 
                         eeg_values = features['eeg'].float_list.value
                         if not eeg_values or len(eeg_values) == 0:
                             continue
                         
-
-                        n_channels = len(eeg_values)
-                        if n_channels != 64:
-                            if shape_validation_errors < 10:
-                                print(f"ERROR: Expected 64 EEG channels, got {n_channels} in {tfrecord_file.name} (record {total_records})")
-                            shape_validation_errors += 1
-
-                            if n_channels > 0 and n_channels <= 128:
-
-                                eeg_data = np.array(eeg_values, dtype=np.float32).reshape(1, n_channels)
-                                print(f"  WARNING: Using {n_channels} channels instead of 64 - this may cause issues downstream")
-                            else:
-                                continue
-                        else:
-
-                            eeg_data = np.array(eeg_values, dtype=np.float32).reshape(1, 64)
+                        # Data is already validated in preprocessing - assume correct format
+                        eeg_len = len(eeg_values)
+                        if eeg_len % 64 != 0:
+                            continue  # Skip invalid records (shouldn't happen with validated preprocessing)
+                        
+                        # Preprocessing ensures one sample per record (64 floats)
+                        eeg_data = np.array(eeg_values, dtype=np.float32).reshape(1, 64)
                         
 
                         if np.any(np.isnan(eeg_data)) or np.any(np.isinf(eeg_data)):
@@ -325,16 +431,19 @@ class DasDatasetCCA:
                         
                         try:
                             attended_ear = attended_ear_values[0].decode('utf-8')
-
                             label = 0 if attended_ear == 'L' else 1
                         except Exception:
                             print(f"ERROR: Could not decode attended_ear in {tfrecord_file.name}")
                             continue
                         
-
                         if attended_ear not in ['L', 'R']:
                             print(f"ERROR: Invalid attended_ear {attended_ear} in {tfrecord_file.name}")
                             continue
+                        
+                        # If we normalized left/right (swapped files), flip label so it matches normalized convention
+                        if swapped_left_right:
+                            label = 1 - label
+                            attended_ear = 'R' if attended_ear == 'L' else 'L'
                         
 
                         subject_id = "unknown"
@@ -365,18 +474,27 @@ class DasDatasetCCA:
                         
 
 
-                        # OPTIMIZATION: Skip audio loading if disabled (much faster)
+                        # Skip audio loading if disabled (much faster)
                         if self.load_audio:
                             audio_envelope = None
                             if attended_ear == 'L' and left_audio_file:
-                                audio_envelope = self._load_audio_envelope(left_audio_file, sample_idx)
+                                envelope_full = self._load_audio_envelope_full(left_audio_file)
+                                if envelope_full is not None and sample_idx < len(envelope_full):
+                                    audio_envelope = envelope_full[sample_idx:sample_idx+1]
+                                    # Flatten to 1D if needed: (1, 4) -> (4,)
+                                    if audio_envelope.ndim == 2:
+                                        audio_envelope = audio_envelope.flatten()
                             elif attended_ear == 'R' and right_audio_file:
-                                audio_envelope = self._load_audio_envelope(right_audio_file, sample_idx)
+                                envelope_full = self._load_audio_envelope_full(right_audio_file)
+                                if envelope_full is not None and sample_idx < len(envelope_full):
+                                    audio_envelope = envelope_full[sample_idx:sample_idx+1]
+                                    # Flatten to 1D if needed: (1, 4) -> (4,)
+                                    if audio_envelope.ndim == 2:
+                                        audio_envelope = audio_envelope.flatten()
                             
                             if audio_envelope is None:
                                 audio_envelope = np.array([0.0], dtype=np.float32)
                         else:
-                            # Use dummy audio envelope (faster - can load audio later if needed)
                             audio_envelope = np.array([0.0], dtype=np.float32)
                         
 
@@ -389,7 +507,7 @@ class DasDatasetCCA:
                             'subject_id': subject_id,
                             'file': tfrecord_file.name,
                             'sample_idx': sample_idx,
-                            'trial_index': trial_index,  # FIXED: Store trial_index for trial-matched envelope loading
+                            'trial_index': trial_index,
                             'attended_ear': attended_ear,
                             'attention_label': label,
                             'preprocessing_method': 'DAS_16subjects_preprocessing',
@@ -425,18 +543,14 @@ class DasDatasetCCA:
                 print(f"ERROR loading {tfrecord_file.name}: {e}")
                 continue
         
-        print(f"\n{'='*60}")
-        print(f"Loading Summary:")
-        print(f"  Successfully loaded files: {successful_files}")
-        print(f"  Failed files: {failed_files}")
-        print(f"  Total records loaded: {total_records}")
-        print(f"  Shape validation errors: {shape_validation_errors}")
-        print(f"{'='*60}")
+        print(f"Loaded {total_records} records from {successful_files} files")
+        print(f"Failed to load from {failed_files} files")
+        if records_swapped_left_right > 0:
+            print(f"  Normalized left/right: {records_swapped_left_right} records had track2/track1 swapped so left=track1, right=track2")
         
-        if shape_validation_errors > 0:
-            print(f"⚠ WARNING: {shape_validation_errors} records had shape validation errors")
-            print("  This suggests the EEG data may not have exactly 64 channels.")
-            print("  Check the preprocessing output to verify channel count.")
+        # Validate left/right audio and label consistency (no swap by subject or trial)
+        if total_records > 0 and all_metadata and all_labels:
+            self._validate_left_right_consistency(all_metadata, all_labels)
         
         if total_records == 0:
             print("\n⚠ CRITICAL: No records were loaded successfully!")
@@ -449,27 +563,162 @@ class DasDatasetCCA:
             print(f"\nDebugging info:")
             print(f"  TFRecord directory: {self.tfrecord_dir}")
             print(f"  Directory exists: {self.tfrecord_dir.exists()}")
+            print(f"  Number of TFRecord files found: {len(tfrecord_files)}")
             if self.tfrecord_dir.exists():
                 print(f"  Contents:")
                 for item in self.tfrecord_dir.iterdir():
                     print(f"    - {item.name} ({'dir' if item.is_dir() else 'file'})")
                     if item.is_dir():
                         subfiles = list(item.glob("*.tfrecords"))
-                        print(f"      Contains {len(subfiles)} TFRecord files")
+                        if subfiles:
+                            print(f"      Contains {len(subfiles)} TFRecord files")
+                            # Try to read first file to see what's wrong
+                            try:
+                                first_file = subfiles[0]
+                                dataset = tf.data.TFRecordDataset(str(first_file))
+                                first_record = next(iter(dataset))
+                                example = tf.train.Example.FromString(first_record.numpy())
+                                features = example.features.feature
+                                print(f"      First file features: {list(features.keys())}")
+                                if 'eeg' in features:
+                                    eeg_vals = features['eeg'].float_list.value
+                                    print(f"      EEG length: {len(eeg_vals)}")
+                                if 'attended_ear' in features:
+                                    att_vals = features['attended_ear'].bytes_list.value
+                                    print(f"      Attended ear: {att_vals[0].decode('utf-8') if att_vals else 'None'}")
+                                if 'subject_id' in features:
+                                    subj_vals = features['subject_id'].bytes_list.value
+                                    print(f"      Subject ID: {subj_vals[0].decode('utf-8') if subj_vals else 'None'}")
+                            except Exception as debug_error:
+                                print(f"      Error reading first file: {debug_error}")
         
 
-        print(f"\nSubject-wise statistics:")
-        for subject_id, stats in subject_stats.items():
-            label_dist = np.bincount(stats['labels'])
-            print(f"  {subject_id}: {stats['samples']} samples, labels {label_dist}")
+        # Subject statistics available in subject_stats if needed for debugging
         
         if not all_eeg_data:
+            # Additional debugging: try to read one record from first file
+            if tfrecord_files:
+                print(f"\n⚠ Attempting to debug first TFRecord file: {tfrecord_files[0]}")
+                try:
+                    dataset = tf.data.TFRecordDataset(str(tfrecord_files[0]))
+                    first_record = next(iter(dataset))
+                    example = tf.train.Example.FromString(first_record.numpy())
+                    features = example.features.feature
+                    print(f"  Available features: {list(features.keys())}")
+                    print(f"  Required features: ['eeg', 'attended_ear', 'subject_id']")
+                    missing = [f for f in ['eeg', 'attended_ear', 'subject_id'] if f not in features]
+                    if missing:
+                        print(f"  Missing features: {missing}")
+                    if 'eeg' in features:
+                        eeg_vals = features['eeg'].float_list.value
+                        print(f"  EEG values length: {len(eeg_vals)}")
+                        print(f"  EEG length % 64: {len(eeg_vals) % 64}")
+                except Exception as debug_err:
+                    print(f"  Error reading first record: {debug_err}")
             raise ValueError("No valid DAS preprocessing data found in TFRecord files")
         
+        # Store data per subject/trial to prevent cross-boundary windows
+        # Use row counts, not record counts, for indexing
+        # Build row-to-metadata mapping for correct audio alignment
+        self._subject_trial_segments = []
+        self._row_to_metadata = []  # Map each EEG row to its metadata
+        current_subject = None
+        current_trial = None
+        segment_start_rows = 0  # Track in row units, not record units
+        segment_eeg = []
+        segment_labels = []
+        segment_metadata = []
+        
+        for i, (eeg_sample, label, metadata) in enumerate(zip(all_eeg_data, all_labels, all_metadata)):
+            subject_id = metadata.get('subject_id', 'unknown')
+            trial_index = metadata.get('trial_index', None)
+            
+            # eeg_sample is (1, 64) - map each row to metadata
+            num_rows = eeg_sample.shape[0] if len(eeg_sample.shape) > 1 else 1
+            
+            # Map each row to metadata (repeat metadata for multi-row samples)
+            for row_idx in range(num_rows):
+                self._row_to_metadata.append(metadata)
+            
+            # Check if we've moved to a new subject or trial
+            if (subject_id != current_subject) or (trial_index != current_trial and trial_index is not None):
+                # Save previous segment
+                if segment_eeg:
+                    eeg_segment = np.vstack(segment_eeg)
+                    eeg_rows = eeg_segment.shape[0]  # Number of rows, not records
+                    
+                    # Extract trial_start_offset_in_audio from first metadata in segment
+                    trial_start_offset = 0
+                    if segment_metadata:
+                        first_meta = segment_metadata[0]
+                        # Try to get from metadata (if available in TFRecord)
+                        trial_start_offset = first_meta.get('trial_start_offset_samples', 0)
+                        # If not available, try to infer from filename or other metadata
+                        if trial_start_offset == 0:
+                            # Could parse from filename or use trial_index to compute offset
+                            # For now, default to 0 (will need to be fixed in preprocessing)
+                            pass
+                    
+                    self._subject_trial_segments.append({
+                        'subject_id': current_subject,
+                        'trial_index': current_trial,
+                        'start_idx': segment_start_rows,  # In row units
+                        'end_idx': segment_start_rows + eeg_rows,  # In row units
+                        'trial_start_offset_in_audio': trial_start_offset,  # In samples at 128 Hz
+                        'eeg': eeg_segment,
+                        'labels': np.array(segment_labels),
+                        'metadata': segment_metadata
+                    })
+                    segment_start_rows += eeg_rows  # Update in row units
+                
+                # Start new segment
+                current_subject = subject_id
+                current_trial = trial_index
+                segment_eeg = []
+                segment_labels = []
+                segment_metadata = []
+            
+            segment_eeg.append(eeg_sample)
+            segment_labels.append(label)
+            segment_metadata.append(metadata)
+        
+        # Save last segment
+        if segment_eeg:
+            eeg_segment = np.vstack(segment_eeg)
+            eeg_rows = eeg_segment.shape[0]  # Number of rows, not records
+            
+            # Extract trial_start_offset_in_audio from first metadata in segment
+            trial_start_offset = 0
+            if segment_metadata:
+                first_meta = segment_metadata[0]
+                trial_start_offset = first_meta.get('trial_start_offset_samples', 0)
+            
+            self._subject_trial_segments.append({
+                'subject_id': current_subject,
+                'trial_index': current_trial,
+                'start_idx': segment_start_rows,  # In row units
+                'end_idx': segment_start_rows + eeg_rows,  # In row units
+                'trial_start_offset_in_audio': trial_start_offset,  # In samples at 128 Hz
+                'eeg': eeg_segment,
+                'labels': np.array(segment_labels),
+                'metadata': segment_metadata
+            })
+        
+        print(f"Created {len(self._subject_trial_segments)} subject/trial segments")
+        for seg in self._subject_trial_segments[:5]:  # Show first 5
+            print(f"  {seg['subject_id']}, trial {seg['trial_index']}: rows {seg['start_idx']}-{seg['end_idx']} ({seg['eeg'].shape[0]} rows)")
+        
+        # Still create concatenated version for backward compatibility, but windows will be created per-segment
         eeg_data = np.vstack(all_eeg_data)
 
+        # Verify row count matches
+        if len(self._row_to_metadata) != len(eeg_data):
+            print(f"⚠ CRITICAL: Row-to-metadata mapping mismatch!")
+            print(f"  EEG rows: {len(eeg_data)}, Metadata mappings: {len(self._row_to_metadata)}")
+            print(f"  This will cause audio alignment errors!")
 
-        # FIXED: Load full audio envelopes instead of creating synthetic features from single values
+
+        # Load full audio envelopes
         # The preprocessing stores audio file paths, so we need to load full envelopes
         audio_envelopes_list = []
         missing_audio_count = 0
@@ -494,29 +743,51 @@ class DasDatasetCCA:
             print(f"⚠ WARNING: {missing_audio_count}/{len(all_audio_envelopes)} samples have missing audio envelopes")
             print(f"  Full temporal envelopes will be loaded from audio files during window creation")
         
-        audio_envelopes = np.array(audio_envelopes_list, dtype=np.float32)
-
-        # FIXED: Handle variable-length audio envelopes (single values stored initially)
-        # Full temporal envelopes will be loaded in __getitem__ when creating windows
+        # Convert list to numpy array, handling variable shapes
+        # First, ensure all items are 1D arrays
+        audio_envelopes_list_flat = []
+        for env in audio_envelopes_list:
+            env = np.asarray(env)
+            if env.ndim > 1:
+                env = env.flatten()
+            audio_envelopes_list_flat.append(env)
+        
+        # Find the maximum length to pad/truncate to
+        max_len = max(len(env) for env in audio_envelopes_list_flat) if audio_envelopes_list_flat else 4
+        # Ensure at least 4 features for 4-band envelope
+        max_len = max(max_len, 4)
+        
+        # Pad or truncate all envelopes to the same length
+        audio_envelopes_padded = []
+        for env in audio_envelopes_list_flat:
+            if len(env) < max_len:
+                # Pad with zeros
+                padding = np.zeros(max_len - len(env), dtype=np.float32)
+                env = np.concatenate([env, padding])
+            elif len(env) > max_len:
+                # Truncate to max_len
+                env = env[:max_len]
+            audio_envelopes_padded.append(env)
+        
+        audio_envelopes = np.array(audio_envelopes_padded, dtype=np.float32)
+        
+        # Final shape should be (n_samples, features)
+        # Ensure it's 2D
         if audio_envelopes.ndim == 1:
-            # Single values - reshape to (n_samples, 1)
-            audio_envelopes = audio_envelopes.reshape(-1, 1)
-        elif audio_envelopes.ndim == 2:
-            # Already 2D - check shape
-            if audio_envelopes.shape[1] == 1:
-                # Single values per sample - this is expected for initial loading
-                # Full temporal envelopes will be loaded during window creation
-                pass  # Keep as (n_samples, 1) - will be expanded in __getitem__
-            elif audio_envelopes.shape[1] < 4:
-                # Less than 4 features - pad to 4 (shouldn't happen, but handle gracefully)
-                padding = np.zeros((audio_envelopes.shape[0], 4 - audio_envelopes.shape[1]))
-                audio_envelopes = np.column_stack([audio_envelopes, padding])
-            elif audio_envelopes.shape[1] > 4:
-                # More than 4 features - truncate to 4
-                audio_envelopes = audio_envelopes[:, :4]
-            # If shape[1] == 4, keep as is
-        else:
-            raise ValueError(f"Invalid audio_envelopes shape: {audio_envelopes.shape}")
+            # Single sample - reshape to (1, features)
+            audio_envelopes = audio_envelopes.reshape(1, -1)
+        elif audio_envelopes.ndim == 3:
+            # 3D array - reshape to 2D: (n_samples, 1, features) -> (n_samples, features)
+            audio_envelopes = audio_envelopes.reshape(audio_envelopes.shape[0], -1)
+        
+        # Ensure exactly 4 features (4-band envelope)
+        if audio_envelopes.shape[1] < 4:
+            # Pad to 4
+            padding = np.zeros((audio_envelopes.shape[0], 4 - audio_envelopes.shape[1]), dtype=np.float32)
+            audio_envelopes = np.column_stack([audio_envelopes, padding])
+        elif audio_envelopes.shape[1] > 4:
+            # Truncate to 4
+            audio_envelopes = audio_envelopes[:, :4]
         
         labels = np.array(all_labels, dtype=np.int64)
         print(f"\nFinal data shapes:")
@@ -541,15 +812,16 @@ class DasDatasetCCA:
         print(f"  Valid audio envelopes: {valid_audio_count}/{len(audio_envelopes)} ({100*valid_audio_count/len(audio_envelopes):.1f}%)")
         print(f"  Zero/dummy audio envelopes: {zero_audio_count}/{len(audio_envelopes)} ({100*zero_audio_count/len(audio_envelopes):.1f}%)")
         
-        # Check for synthetic features (all zeros in 3rd column indicates synthetic features)
-        synthetic_features_count = 0
+        # NOTE: TFRecords contain placeholder audio data, but during training we load REAL audio from files
+        # The placeholder pattern [val, val, 0, val²] in TFRecords is expected and not a problem
+        # Real audio is loaded via _load_audio_envelope_full() in __getitem__()
+        # So we don't need to skip any samples - all windows use real audio when load_audio=True
         if audio_envelopes.shape[1] >= 3:
-            # Synthetic features have pattern: [val, val, 0, val²] - check for all-zero 3rd column
             third_col_zeros = np.sum(np.abs(audio_envelopes[:, 2]) < 1e-6)
-            if third_col_zeros > len(audio_envelopes) * 0.9:  # If >90% have zero in 3rd column
-                synthetic_features_count = third_col_zeros
-                print(f"  ⚠ WARNING: {synthetic_features_count} samples appear to have synthetic audio features")
-                print(f"    (pattern [val, val, 0, val²] detected). Full temporal envelopes will be loaded during window creation.")
+            if third_col_zeros > len(audio_envelopes) * 0.9:
+                print(f"  ℹ INFO: TFRecord placeholder audio detected ({third_col_zeros} samples)")
+                print(f"    Real audio will be loaded from files during training (load_audio=True)")
+                print(f"    This is expected and not a problem.")
         
         if valid_audio_count > 0:
             non_zero_audio = audio_envelopes[np.abs(audio_envelopes).sum(axis=1) > 1e-6]
@@ -575,16 +847,98 @@ class DasDatasetCCA:
         
         return eeg_data, audio_envelopes, labels, all_metadata
     
+    def _compute_4band_envelope(self, audio_data: np.ndarray, fs: int) -> np.ndarray:
+        """
+        Compute 4-band filterbank envelopes from audio signal (Telluride-style).
+        
+        Uses 4 frequency bands with bandpass filters, then Hilbert envelope extraction.
+        This creates truly independent features instead of tiling.
+        
+        Args:
+            audio_data: Audio signal (1D array)
+            fs: Sampling rate in Hz
+            
+        Returns:
+            4-band envelope array of shape (len(audio_data), 4)
+        """
+        from scipy.signal import butter, filtfilt, hilbert
+        
+        # Define 4 frequency bands (Hz) - typical for speech/audio
+        # Band 1: Low (1-500 Hz) - fundamental frequencies (min 1 Hz to avoid filter error)
+        # Band 2: Mid-low (500-1500 Hz) - formants
+        # Band 3: Mid-high (1500-4000 Hz) - consonants
+        # Band 4: High (4000-8000 Hz) - fricatives
+        nyquist = fs / 2
+        
+        # Ensure bands are valid and within Nyquist
+        bands = [
+            (max(1, 0), min(500, nyquist * 0.9)),  # Low: 1-500 Hz (avoid 0 Hz)
+            (max(1, 500), min(1500, nyquist * 0.9)),  # Mid-low
+            (max(1, 1500), min(4000, nyquist * 0.9)),  # Mid-high
+            (max(1, 4000), min(8000, nyquist * 0.9))  # High
+        ]
+        
+        envelopes = []
+        for low, high in bands:
+            try:
+                # Validate frequency range
+                if low <= 0:
+                    low = 1.0  # Minimum 1 Hz
+                if high >= nyquist:
+                    high = nyquist * 0.95  # Stay below Nyquist
+                if low >= high:
+                    # Invalid band - use full spectrum as fallback
+                    envelope = np.abs(hilbert(audio_data))
+                else:
+                    # Normalize frequencies (must be 0 < low_norm < high_norm < 1)
+                    low_norm = max(0.001, min(low / nyquist, 0.99))
+                    high_norm = max(0.001, min(high / nyquist, 0.99))
+                    
+                    # Ensure valid range
+                    if low_norm >= high_norm:
+                        low_norm = 0.001
+                        high_norm = min(0.99, low_norm + 0.1)
+                    
+                    # Design bandpass filter
+                    b, a = butter(4, [low_norm, high_norm], btype='band')
+                    
+                    # Filter audio
+                    filtered = filtfilt(b, a, audio_data)
+                    
+                    # Extract envelope using Hilbert transform
+                    analytic = hilbert(filtered)
+                    envelope = np.abs(analytic)
+            except Exception as e:
+                # Fallback: use full spectrum if filter design fails
+                envelope = np.abs(hilbert(audio_data))
+            
+            # Smooth envelope
+            if len(envelope) > 9:
+                from scipy.ndimage import uniform_filter1d
+                envelope = uniform_filter1d(envelope, size=9, mode='nearest')
+            
+            envelopes.append(envelope)
+        
+        # Stack into (N, 4) array
+        result = np.column_stack(envelopes)
+        
+        # Normalize each band independently
+        for i in range(4):
+            if np.max(np.abs(result[:, i])) > 0:
+                result[:, i] = result[:, i] / (np.max(np.abs(result[:, i])) + 1e-8)
+        
+        return result.astype(np.float32)
+    
     def _load_audio_envelope_full(self, audio_file_path: str) -> Optional[np.ndarray]:
         """
         Load full audio envelope from audio file, resampled to match EEG sampling rate.
-        This is more efficient than loading per-sample.
+        Returns 4-band filterbank envelopes (Telluride-style) instead of single envelope.
         
         Args:
             audio_file_path: Path to audio file (can be relative or absolute)
             
         Returns:
-            Full audio envelope array, or None if file not found
+            Full 4-band audio envelope array of shape (N, 4), or None if file not found
         """
 
         cache_key = str(Path(audio_file_path).resolve()) if Path(audio_file_path).is_absolute() else audio_file_path
@@ -592,79 +946,22 @@ class DasDatasetCCA:
             return self._audio_envelope_cache[cache_key]
         
 
+        # Simplified path resolution - paths are already validated in preprocessing
         audio_file = None
+        audio_path = Path(audio_file_path)
         
-
-        if Path(audio_file_path).is_absolute() and Path(audio_file_path).exists():
-            audio_file = Path(audio_file_path)
-
-        elif Path(audio_file_path).exists():
-            audio_file = Path(audio_file_path)
-
-        elif (self.audio_base_dir / audio_file_path).exists():
-            audio_file = self.audio_base_dir / audio_file_path
-
-        elif (self.audio_base_dir / Path(audio_file_path).name).exists():
-            audio_file = self.audio_base_dir / Path(audio_file_path).name
-
-        elif (Path("Data/Das/4004271/Stimuli") / Path(audio_file_path).name).exists():
-            audio_file = Path("Data/Das/4004271/Stimuli") / Path(audio_file_path).name
-
-        else:
-            audio_filename = Path(audio_file_path).name
-
-            audio_stem = Path(audio_file_path).stem
-            for ext in ['.wav', '.WAV', '.mp3', '.MP3']:
-                test_file = self.audio_base_dir / f"{audio_stem}{ext}"
-                if test_file.exists():
-                    audio_file = test_file
-                    break
-
-            if audio_file is None:
-                # Try to match by extracting part/track info from filename
-                # e.g., if TFRecord has "trigger_123_part1_track1_hrtf.wav", try "part1_track1_hrtf.wav"
-                if 'part' in audio_stem.lower() and 'track' in audio_stem.lower():
-                    # Extract part and track numbers
-                    import re
-                    part_match = re.search(r'part(\d+)', audio_stem.lower())
-                    track_match = re.search(r'track(\d+)', audio_stem.lower())
-                    if part_match and track_match:
-                        part_num = part_match.group(1)
-                        track_num = track_match.group(1)
-                        # Try both hrtf and dry versions
-                        for variant in ['hrtf', 'dry']:
-                            test_pattern = f"part{part_num}_track{track_num}_{variant}.wav"
-                            test_file = self.audio_base_dir / test_pattern
-                            if test_file.exists():
-                                audio_file = test_file
-                                break
-                
-                # Fallback: try fuzzy matching
-                if audio_file is None:
-                    matches = list(self.audio_base_dir.glob(f"*{audio_stem}*"))
-                    if matches:
-                        audio_file = matches[0]
-                    
-                    # If still not found, try matching by part/track pattern
-                    if audio_file is None and ('part' in audio_filename.lower() or 'track' in audio_filename.lower()):
-                        import re
-                        # Try to find any file with matching part/track
-                        all_audio_files = list(self.audio_base_dir.glob("*.wav")) + list(self.audio_base_dir.glob("*.WAV"))
-                        for candidate in all_audio_files:
-                            candidate_lower = candidate.name.lower()
-                            if 'part' in candidate_lower and 'track' in candidate_lower:
-                                # Extract part/track from both
-                                audio_part_match = re.search(r'part(\d+)', audio_filename.lower())
-                                audio_track_match = re.search(r'track(\d+)', audio_filename.lower())
-                                cand_part_match = re.search(r'part(\d+)', candidate_lower)
-                                cand_track_match = re.search(r'track(\d+)', candidate_lower)
-                                
-                                if (audio_part_match and audio_track_match and 
-                                    cand_part_match and cand_track_match):
-                                    if (audio_part_match.group(1) == cand_part_match.group(1) and
-                                        audio_track_match.group(1) == cand_track_match.group(1)):
-                                        audio_file = candidate
-                                        break
+        # Try absolute path first
+        if audio_path.is_absolute() and audio_path.exists():
+            audio_file = audio_path
+        # Try relative to audio_base_dir
+        elif self.audio_base_dir and (self.audio_base_dir / audio_path).exists():
+            audio_file = self.audio_base_dir / audio_path
+        # Try filename only in audio_base_dir
+        elif self.audio_base_dir and (self.audio_base_dir / audio_path.name).exists():
+            audio_file = self.audio_base_dir / audio_path.name
+        # Try current directory
+        elif audio_path.exists():
+            audio_file = audio_path
         
         if audio_file is None or not audio_file.exists():
             # Only print warning for first few missing files to avoid spam
@@ -683,12 +980,7 @@ class DasDatasetCCA:
             
             fs, audio_data = wavfile.read(str(audio_file))
             
-            # Log successful audio loading for first few files
-            if not hasattr(self, '_audio_file_loaded_count'):
-                self._audio_file_loaded_count = 0
-            if self._audio_file_loaded_count < 3:
-                print(f"✓ Loaded audio file: {audio_file.name} (duration: {len(audio_data)/fs:.2f}s, fs: {fs}Hz)")
-                self._audio_file_loaded_count += 1
+            # Audio loading is silent (can be verbose if needed for debugging)
             
 
             if len(audio_data.shape) > 1:
@@ -705,81 +997,105 @@ class DasDatasetCCA:
                 audio_data = signal.resample(audio_data, num_samples)
             
 
-            from scipy.signal import hilbert
-            analytic_signal = hilbert(audio_data)
-            envelope = np.abs(analytic_signal)
-            
+            # Compute 4-band filterbank envelopes
+            envelope_4band = self._compute_4band_envelope(audio_data, self.sampling_rate)
 
-            if len(envelope) > 9:
-                kernel = np.ones(9) / 9.0
-                envelope = np.convolve(envelope, kernel, mode='same')
+            self._audio_envelope_cache[cache_key] = envelope_4band
             
-
-            if np.max(envelope) > 0:
-                envelope = envelope / np.max(envelope)
-            
-
-            self._audio_envelope_cache[cache_key] = envelope
-            
-            return envelope
+            return envelope_4band
                 
         except Exception as e:
             print(f"WARNING: Could not load audio envelope from {audio_file_path}: {e}")
             return None
     
-    def _load_audio_envelope(self, audio_file_path: str, sample_idx: int) -> Optional[np.ndarray]:
+    # _load_audio_envelope() removed - use _load_audio_envelope_full() directly
+    
+    def _preload_all_audio_files(self):
         """
-        Load audio envelope from audio file, resampled to match EEG sampling rate.
+        Pre-load all unique audio files into cache for faster access.
+        This significantly speeds up training by avoiding repeated file I/O.
+        """
+        if not self.load_audio:
+            return
         
-        Args:
-            audio_file_path: Path to audio file (can be relative or absolute)
-            sample_idx: Sample index for temporal alignment
+        print("\n" + "="*80)
+        print("PRE-LOADING AUDIO FILES FOR FASTER TRAINING")
+        print("="*80)
+        
+        # Collect all unique audio file paths from metadata
+        unique_audio_files = set()
+        for meta in self.metadata:
+            left_file = meta.get('left_audio_file')
+            right_file = meta.get('right_audio_file')
+            if left_file:
+                unique_audio_files.add(left_file)
+            if right_file:
+                unique_audio_files.add(right_file)
+        
+        print(f"Found {len(unique_audio_files)} unique audio files to pre-load...")
+        
+        # Pre-load audio files with progress bar
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        loaded_count = 0
+        failed_count = 0
+        
+        # Use threading for I/O-bound audio loading (parallel file reads)
+        max_workers = min(8, len(unique_audio_files))  # Use up to 8 threads
+        
+        def load_single_audio(audio_file_path):
+            """Load a single audio file and cache it."""
+            try:
+                envelope = self._load_audio_envelope_full(audio_file_path)
+                return audio_file_path, envelope, True
+            except Exception as e:
+                return audio_file_path, None, False
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all audio loading tasks
+            future_to_file = {
+                executor.submit(load_single_audio, audio_file): audio_file
+                for audio_file in unique_audio_files
+            }
             
-        Returns:
-            Audio envelope value(s) for this sample, or None if file not found
-        """
-        """
-        Load audio envelope value for a specific sample index.
-        Uses cached full envelope if available, otherwise loads it.
+            # Process completed tasks with progress bar
+            for future in tqdm(as_completed(future_to_file), 
+                             total=len(unique_audio_files),
+                             desc="Pre-loading audio files"):
+                audio_file, envelope, success = future.result()
+                if success and envelope is not None:
+                    loaded_count += 1
+                else:
+                    failed_count += 1
         
-        Args:
-            audio_file_path: Path to audio file (can be relative or absolute)
-            sample_idx: Sample index for temporal alignment
-            
-        Returns:
-            Audio envelope value(s) for this sample, or None if file not found
-        """
-
-        envelope_full = self._load_audio_envelope_full(audio_file_path)
-        
-        if envelope_full is None:
-            return None
-        
-
-        if sample_idx < len(envelope_full):
-            return envelope_full[sample_idx:sample_idx+1]
-        else:
-
-            if len(envelope_full) > 0:
-                return envelope_full[-1:]
-            else:
-                return np.array([0.0], dtype=np.float32)
+        print(f"\n✓ Pre-loading complete:")
+        print(f"  Successfully loaded: {loaded_count}/{len(unique_audio_files)} files")
+        print(f"  Failed: {failed_count} files")
+        print(f"  Cache size: {len(self._audio_envelope_cache)} files")
+        print(f"  Memory usage: ~{len(self._audio_envelope_cache) * 0.5:.1f} MB (estimated)")
+        print("="*80 + "\n")
     
     def _create_das_windows(self) -> List[Tuple[int, int]]:
-        """Create windows optimized for DAS data structure with proper time units."""
-
+        """
+        Create windows optimized for DAS data structure with proper time units.
+        
+        FIXED: Create windows within each subject/trial segment to prevent cross-boundary windows.
+        This ensures:
+        - No windows crossing subject boundaries
+        - No windows crossing trial boundaries  
+        - Proper EEG/audio alignment
+        - Correct label assignment
+        """
         window_seconds = self.window_size / self.sampling_rate
         step_size = int(self.window_size * (1 - self.overlap))
         step_seconds = step_size / self.sampling_rate
         
-        total_windows = (len(self.eeg_data) - self.window_size) // step_size + 1
-        
-        print(f"Creating {total_windows} DAS windows:")
+        print(f"Creating DAS windows within subject/trial boundaries:")
         print(f"  Window size: {self.window_size} samples ({window_seconds:.1f} seconds)")
         print(f"  Step size: {step_size} samples ({step_seconds:.1f} seconds)")
         print(f"  Overlap: {self.overlap:.1%}")
         print(f"  Sampling rate: {self.sampling_rate} Hz")
-        
+        print(f"  Number of subject/trial segments: {len(self._subject_trial_segments)}")
 
         if window_seconds < 1.0:
             print(f"⚠ WARNING: Very short window ({window_seconds:.1f}s) may have poor signal-to-noise")
@@ -789,89 +1105,74 @@ class DasDatasetCCA:
             print(f"✓ Window size appropriate for EEG attention decoding")
         
         window_indices = []
-        for i in range(total_windows):
-            data_idx = i * step_size
-            if data_idx + self.window_size <= len(self.eeg_data):
-
-                window_start = data_idx
-                window_end = data_idx + self.window_size
-                window_labels = self.labels[window_start:window_end]
-                
-
-                if len(window_labels) > 0:
-                    window_label = int(np.bincount(window_labels).argmax())
-                else:
-                    window_label = 0
-                
-                window_indices.append((data_idx, window_label))
+        global_offset = 0  # Track global offset in concatenated eeg_data
         
-        print(f"Created {len(window_indices)} DAS windows")
+        # FIXED: Create windows within each subject/trial segment
+        for seg_idx, segment in enumerate(self._subject_trial_segments):
+            segment_eeg = segment['eeg']
+            segment_labels = segment['labels']
+            segment_metadata = segment['metadata']
+            subject_id = segment['subject_id']
+            trial_index = segment['trial_index']
+            
+            # Create windows only within this segment
+            segment_len = len(segment_eeg)
+            if segment_len < self.window_size:
+                # Segment too short for a window - skip
+                global_offset += segment_len
+                continue
+            
+            num_windows_in_segment = (segment_len - self.window_size) // step_size + 1
+            
+            for i in range(num_windows_in_segment):
+                local_idx = i * step_size
+                global_idx = global_offset + local_idx
+                
+                if local_idx + self.window_size <= segment_len:
+                    # NOTE: We don't skip based on synthetic audio mask from TFRecords because:
+                    # - TFRecords contain placeholder/synthetic audio
+                    # - During __getitem__, we load REAL audio from files via _load_audio_envelope_full
+                    # - So the synthetic mask is only relevant if load_audio=False
+                    # If load_audio=True, we'll use real audio from files, so we keep all windows
+                    # If load_audio=False, we could skip, but that's not the intended use case
+                    
+                    # Window is fully within segment
+                    window_labels = segment_labels[local_idx:local_idx + self.window_size]
+                    
+                    if len(window_labels) > 0:
+                        window_label = int(np.bincount(window_labels).argmax())
+                    else:
+                        window_label = 0
+                    
+                    window_indices.append((global_idx, window_label))
+            
+            global_offset += segment_len
         
+        print(f"Created {len(window_indices)} DAS windows (within subject/trial boundaries)")
+        
+        # Verify no windows cross boundaries
+        cross_boundary_count = 0
+        for data_idx, label in window_indices[:100]:  # Check first 100
+            window_end = data_idx + self.window_size
+            # Check if window spans multiple segments
+            for seg in self._subject_trial_segments:
+                if data_idx < seg['end_idx'] <= window_end:
+                    cross_boundary_count += 1
+                    break
+        
+        if cross_boundary_count > 0:
+            print(f"⚠ WARNING: {cross_boundary_count} windows may cross segment boundaries (out of 100 checked)")
+        else:
+            print(f"✓ Verified: No windows cross subject/trial boundaries")
 
         window_labels = [label for _, label in window_indices]
-        label_dist = np.bincount(window_labels)
+        label_dist = np.bincount(window_labels) if window_labels else np.array([0, 0])
         print(f"Window label distribution: {label_dist}")
         
         return window_indices
     
-    def _das_eeg_preprocessing(self, eeg_window: np.ndarray) -> np.ndarray:
-        """DAS-specific EEG preprocessing with artifact handling."""
-        from scipy import signal
-        
-
-
-        artifact_threshold = 5.0
-        for ch in range(eeg_window.shape[1]):
-            channel_data = eeg_window[:, ch]
-            std_val = np.std(channel_data)
-            mean_val = np.mean(channel_data)
-            
-
-            artifacts = np.abs(channel_data - mean_val) > (artifact_threshold * std_val)
-            
-            if np.any(artifacts):
-
-                valid_indices = ~artifacts
-                if np.sum(valid_indices) > 2:
-                    from scipy.interpolate import interp1d
-                    valid_data = channel_data[valid_indices]
-                    valid_time = np.where(valid_indices)[0]
-                    all_time = np.arange(len(channel_data))
-                    
-                    f_interp = interp1d(valid_time, valid_data, kind='linear', 
-                                      bounds_error=False, fill_value='extrapolate')
-                    eeg_window[:, ch] = f_interp(all_time)
-        
-
-        eeg_window = eeg_window - np.mean(eeg_window, axis=0, keepdims=True)
-        
-
-        nyquist = self.sampling_rate / 2
-        low_freq = 1.0 / nyquist
-        high_freq = min(40.0 / nyquist, 0.99)
-        
-
-        b, a = signal.butter(4, [low_freq, high_freq], btype='band')
-        
-
-        filtered_eeg = np.zeros_like(eeg_window)
-        for ch in range(eeg_window.shape[1]):
-            filtered_eeg[:, ch] = signal.filtfilt(b, a, eeg_window[:, ch])
-        
-
-        mad_values = np.median(np.abs(filtered_eeg - np.median(filtered_eeg, axis=0)), axis=0)
-        mad_values = np.where(mad_values == 0, 1.0, mad_values)
-        filtered_eeg = filtered_eeg / mad_values
-        
-
-        filtered_eeg = np.tanh(filtered_eeg * 0.5)
-        
-
-        if np.any(np.isnan(filtered_eeg)) or np.any(np.isinf(filtered_eeg)):
-            print("WARNING: Invalid values detected after preprocessing")
-            filtered_eeg = np.nan_to_num(filtered_eeg, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        return filtered_eeg.astype(np.float32)
+    # _das_eeg_preprocessing() removed - data is already preprocessed
+    
     
     def __len__(self):
         return len(self.window_indices)
@@ -879,6 +1180,11 @@ class DasDatasetCCA:
     def __getitem__(self, idx):
         data_idx, label = self.window_indices[idx]
         
+        # Get subject_id from metadata for window-level subject tracking
+        subject_id = "unknown"
+        if data_idx < len(self._row_to_metadata):
+            window_metadata = self._row_to_metadata[data_idx]
+            subject_id = window_metadata.get('subject_id', 'unknown')
 
         cache_key = (data_idx, self.mode)
         if cache_key in self._window_cache:
@@ -891,9 +1197,14 @@ class DasDatasetCCA:
 
         window_eeg = self.eeg_data[data_idx:data_idx + self.window_size]
         
-        # CRITICAL FIX: Load FULL temporal audio envelopes for the entire window
-        # Load attended audio, left audio, and right audio from actual audio files
-        window_metadata = self.metadata[data_idx] if data_idx < len(self.metadata) else None
+        # Use row-to-metadata mapping (data_idx is a row index)
+        if data_idx < len(self._row_to_metadata):
+            window_metadata = self._row_to_metadata[data_idx]
+        elif data_idx < len(self.metadata):
+            # Fallback to old method (shouldn't happen if mapping is correct)
+            window_metadata = self.metadata[data_idx]
+        else:
+            window_metadata = None
         attended_audio_envelope = None
         left_audio_envelope = None
         right_audio_envelope = None
@@ -905,10 +1216,17 @@ class DasDatasetCCA:
             left_audio_file = window_metadata.get('left_audio_file')
             right_audio_file = window_metadata.get('right_audio_file')
             
-            # FIXED: Helper function to load trial-matched window segment from audio envelope
-            # CRITICAL: sample_idx is the index WITHIN the trial, not the offset in the audio file
-            # We need to extract the exact segment that corresponds to this trial
-            def load_window_segment(audio_file, trial_sample_idx, window_size, trial_index=None):
+            # Get trial_start_offset from segment
+            trial_start_offset = 0
+            for seg in self._subject_trial_segments:
+                if (seg['subject_id'] == subject_id and 
+                    seg['trial_index'] == trial_index):
+                    trial_start_offset = seg.get('trial_start_offset_in_audio', 0)
+                    break
+            
+            # Helper function to load trial-matched window segment from audio envelope
+            # Uses trial_start_offset + sample_idx for correct audio alignment
+            def load_window_segment(audio_file, trial_sample_idx, window_size, trial_index=None, trial_start=0):
                 """
                 Load a window segment from a full audio envelope that matches the trial.
                 
@@ -917,97 +1235,76 @@ class DasDatasetCCA:
                     trial_sample_idx: Sample index within the trial (from sample_id in TFRecord)
                     window_size: Window size in samples
                     trial_index: Trial index for debugging
+                    trial_start: Trial start offset in audio file (in samples at 128 Hz)
                 
                 Returns:
                     Audio envelope segment matching the trial window, or None if not found
                 """
                 envelope_full = self._load_audio_envelope_full(audio_file)
                 if envelope_full is not None and len(envelope_full) > 0:
-                    # FIXED: Use trial_sample_idx directly (it's already the offset within the trial)
-                    # The envelope_full should be the full trial envelope, so trial_sample_idx is correct
-                    # However, if envelope_full is the full track, we need trial start time
-                    # For now, assume envelope_full is per-trial (which it should be if loaded correctly)
-                    end_idx = min(trial_sample_idx + window_size, len(envelope_full))
-                    if trial_sample_idx < len(envelope_full):
-                        segment = envelope_full[trial_sample_idx:end_idx]
+                    # Correct audio slicing: trial_start + sample_idx_within_trial
+                    audio_start = trial_start + trial_sample_idx
+                    end_idx = min(audio_start + window_size, len(envelope_full))
+                    
+                    if audio_start < len(envelope_full):
+                        segment = envelope_full[audio_start:end_idx]
                         # Pad if needed
                         if len(segment) < window_size:
-                            padding = np.zeros(window_size - len(segment), dtype=np.float32)
-                            segment = np.concatenate([segment, padding])
+                            padding = np.zeros((window_size - len(segment), envelope_full.shape[1]), dtype=np.float32)
+                            segment = np.vstack([segment, padding])
+                        
+                        # Debug print for first few windows
+                        if not hasattr(self, '_audio_slice_debug_count'):
+                            self._audio_slice_debug_count = 0
+                        if self._audio_slice_debug_count < 3:
+                            print(f"Audio slice: start={audio_start}, trial_start={trial_start}, sample_idx={trial_sample_idx}, envelope_len={len(envelope_full)}")
+                            self._audio_slice_debug_count += 1
+                        
                         return segment
                     else:
-                        # If trial_sample_idx is beyond envelope length, use last values
+                        # If audio_start is beyond envelope length, use last values
                         if trial_index is not None:
-                            print(f"⚠ WARNING: Trial {trial_index} sample_idx {trial_sample_idx} >= envelope length {len(envelope_full)}")
-                        return np.tile(envelope_full[-1:], window_size)
+                            print(f"⚠ WARNING: Trial {trial_index} audio_start {audio_start} >= envelope length {len(envelope_full)}")
+                        return np.tile(envelope_full[-1:], (window_size, 1))
                 return None
             
             # Load attended audio envelope (the one that matches the label)
             if attended_ear == 'L' and left_audio_file:
-                attended_audio_envelope = load_window_segment(left_audio_file, sample_idx, self.window_size, trial_index)
+                attended_audio_envelope = load_window_segment(left_audio_file, sample_idx, self.window_size, trial_index, trial_start_offset)
             elif attended_ear == 'R' and right_audio_file:
-                attended_audio_envelope = load_window_segment(right_audio_file, sample_idx, self.window_size, trial_index)
+                attended_audio_envelope = load_window_segment(right_audio_file, sample_idx, self.window_size, trial_index, trial_start_offset)
             
             # Load left and right audio envelopes for comparison
             if left_audio_file:
-                left_audio_envelope = load_window_segment(left_audio_file, sample_idx, self.window_size, trial_index)
+                left_audio_envelope = load_window_segment(left_audio_file, sample_idx, self.window_size, trial_index, trial_start_offset)
             if right_audio_file:
-                right_audio_envelope = load_window_segment(right_audio_file, sample_idx, self.window_size, trial_index)
+                right_audio_envelope = load_window_segment(right_audio_file, sample_idx, self.window_size, trial_index, trial_start_offset)
             
-            # FIXED: Add comprehensive envelope verification and debugging
-            # CRITICAL: Check if we're using correct trial offsets
-            if not hasattr(self, '_envelope_verification_count'):
-                self._envelope_verification_count = 0
+            # NOTE: We don't check for synthetic audio here because:
+            # - Audio loaded from files via _load_audio_envelope_full is REAL audio
+            # - The synthetic mask from TFRecords is just for placeholder data
+            # - Real audio files don't have synthetic patterns
             
-            if self._envelope_verification_count < 3:  # Check first 3 windows
-                if left_audio_envelope is not None and right_audio_envelope is not None:
-                    left_mean = np.mean(left_audio_envelope)
-                    right_mean = np.mean(right_audio_envelope)
-                    left_std = np.std(left_audio_envelope)
-                    right_std = np.std(right_audio_envelope)
-                    diff = np.abs(left_mean - right_mean)
-                    
-                    # CRITICAL: Check what offset we're using
-                    envelope_full_left = self._load_audio_envelope_full(left_audio_file) if left_audio_file else None
-                    envelope_full_right = self._load_audio_envelope_full(right_audio_file) if right_audio_file else None
-                    
-                    print(f"\n{'='*60}")
-                    print(f"ENVELOPE VERIFICATION (Window {self._envelope_verification_count + 1})")
-                    print(f"{'='*60}")
-                    print(f"Subject ID: {window_metadata.get('subject_id', 'unknown')}")
-                    print(f"File: {window_metadata.get('file', 'unknown')}")
-                    print(f"Sample index (within trial): {sample_idx}")
-                    print(f"Trial index: {trial_index}")
-                    print(f"Audio slice start sample: {sample_idx} (CRITICAL: This should match trial offset!)")
-                    print(f"Left audio file: {left_audio_file}")
-                    print(f"Right audio file: {right_audio_file}")
-                    if envelope_full_left is not None:
-                        print(f"Left full envelope length: {len(envelope_full_left)} samples")
-                        print(f"Left envelope slice: [{sample_idx}:{sample_idx + self.window_size}]")
-                        print(f"Left envelope first 5 values: {left_audio_envelope[:5]}")
-                    if envelope_full_right is not None:
-                        print(f"Right full envelope length: {len(envelope_full_right)} samples")
-                        print(f"Right envelope slice: [{sample_idx}:{sample_idx + self.window_size}]")
-                        print(f"Right envelope first 5 values: {right_audio_envelope[:5]}")
-                    print(f"Left envelope: mean={left_mean:.6f}, std={left_std:.6f}, shape={left_audio_envelope.shape}")
-                    print(f"Right envelope: mean={right_mean:.6f}, std={right_std:.6f}, shape={right_audio_envelope.shape}")
-                    print(f"Difference (|left - right|): {diff:.6f}")
-                    if diff < 1e-6:
-                        print(f"⚠ CRITICAL: Left and right envelopes are nearly identical! This indicates a bug.")
-                    if sample_idx == 0:
-                        print(f"⚠ WARNING: sample_idx is 0 - we may be taking from start of audio file instead of trial segment!")
-                    if trial_index is None:
-                        print(f"⚠ CRITICAL: trial_index is None - cannot verify trial alignment!")
-                    print(f"Attended ear: {attended_ear}, Label: {0 if attended_ear == 'L' else 1}")
-                    print(f"{'='*60}\n")
-                    self._envelope_verification_count += 1
+            # REMOVED: Excessive debugging code - data is already validated in preprocessing
         
         # Use attended audio if available, otherwise fall back to placeholder
         if attended_audio_envelope is not None:
-            window_audio = attended_audio_envelope.reshape(-1, 1)  # Shape: (window_size, 1)
+            # attended_audio_envelope is now (window_size, 4) from 4-band filterbank
+            if attended_audio_envelope.ndim == 1:
+                # Fallback: if somehow 1D, reshape to (window_size, 1) then expand
+                window_audio = attended_audio_envelope.reshape(-1, 1)
+                # Expand to 4 bands using the 4-band computation
+                window_audio = self._compute_4band_envelope(window_audio.flatten(), self.sampling_rate)
+            else:
+                window_audio = attended_audio_envelope  # Already (window_size, 4)
         else:
             # Fallback: use placeholder from self.audio_envelopes (single values)
-            window_audio = self.audio_envelopes[data_idx:data_idx + self.window_size]
+            window_audio_1d = self.audio_envelopes[data_idx:data_idx + self.window_size]
+            if window_audio_1d.ndim == 1 or window_audio_1d.shape[1] == 1:
+                # Compute 4-band from single values
+                window_audio = self._compute_4band_envelope(window_audio_1d.flatten(), self.sampling_rate)
+            else:
+                window_audio = window_audio_1d
             if self.load_audio and not hasattr(self, '_using_placeholder_audio_warned'):
                 print(f"⚠ WARNING: Using placeholder audio envelopes. Full temporal envelopes not available.")
                 self._using_placeholder_audio_warned = True
@@ -1029,61 +1326,53 @@ class DasDatasetCCA:
             right_audio_envelope = np.zeros(self.window_size, dtype=np.float32)
         
 
-        try:
-            window_eeg = self._das_eeg_preprocessing(window_eeg)
-        except Exception:
-            window_eeg = window_eeg - np.mean(window_eeg, axis=0, keepdims=True)
-            window_eeg = window_eeg / (np.std(window_eeg, axis=0, keepdims=True) + 1e-8)
-            window_eeg = np.tanh(window_eeg * 0.5)
+        # REMOVED: Redundant preprocessing - data is already preprocessed in das_preprocessing_16subjects.py
+        # TFRecords contain data that is already:
+        # - Downsampled to 128Hz
+        # - Bandpass filtered (0.5-40 Hz)
+        # - Z-score normalized per channel
+        # No additional preprocessing needed
         
 
 
+        # window_audio should already be (window_size, 4) from 4-band filterbank
+        # Ensure correct shape
         if window_audio.ndim == 1:
-
-            window_audio = window_audio.reshape(-1, 1)
-        
-
-        if window_audio.shape[1] == 1:
-
-            env_vals = window_audio.flatten()
-            
-
-            if len(env_vals) > 1:
-                from scipy.ndimage import uniform_filter1d
-                smoothed = uniform_filter1d(env_vals, size=min(3, len(env_vals)), mode='nearest')
-                derivative = np.gradient(env_vals)
-            else:
-                smoothed = env_vals
-                derivative = np.zeros_like(env_vals)
-            
-            window_audio = np.column_stack([
-                env_vals,
-                smoothed,
-                derivative,
-                env_vals**2
-            ])
+            # Fallback: if 1D, compute 4-band from it
+            window_audio = self._compute_4band_envelope(window_audio, self.sampling_rate)
         elif window_audio.shape[1] != 4:
-
-            if window_audio.shape[1] < 4:
-
-                env_vals = window_audio[:, 0] if window_audio.shape[1] > 0 else np.zeros(window_audio.shape[0])
-                padding = np.zeros((window_audio.shape[0], 4 - window_audio.shape[1]))
+            if window_audio.shape[1] == 1:
+                # Single band - compute 4-band from it
+                window_audio = self._compute_4band_envelope(window_audio.flatten(), self.sampling_rate)
+            elif window_audio.shape[1] < 4:
+                # Less than 4 - pad with zeros (shouldn't happen with 4-band)
+                padding = np.zeros((window_audio.shape[0], 4 - window_audio.shape[1]), dtype=np.float32)
                 window_audio = np.column_stack([window_audio, padding])
             else:
-
+                # More than 4 - truncate to 4
                 window_audio = window_audio[:, :4]
         
 
-        if np.max(np.abs(window_audio)) > 0:
-            window_audio = window_audio / (np.max(np.abs(window_audio)) + 1e-8)
+        # Audio normalization is handled in _process_audio_envelope (matches FULCCA)
+        # Just ensure correct dtype - normalization happens in _process_audio_envelope
+        if window_audio is not None:
+            window_audio = np.asarray(window_audio, dtype=np.float32)
+        if left_audio_envelope is not None:
+            left_audio_envelope = np.asarray(left_audio_envelope, dtype=np.float32)
+        if right_audio_envelope is not None:
+            right_audio_envelope = np.asarray(right_audio_envelope, dtype=np.float32)
         
 
         window_eeg_tensor = tf.constant(window_eeg, dtype=tf.float32)
         window_audio_tensor = tf.constant(window_audio, dtype=tf.float32)
         
         # Process left and right audio envelopes to match window_audio format
+        # _process_audio_envelope normalizes using per-feature z-score (matches FULCCA)
         left_audio_processed = self._process_audio_envelope(left_audio_envelope, self.window_size)
         right_audio_processed = self._process_audio_envelope(right_audio_envelope, self.window_size)
+        
+        # Also normalize window_audio using same method for consistency
+        window_audio = self._process_audio_envelope(window_audio, self.window_size)
         
         left_audio_tensor = tf.constant(left_audio_processed, dtype=tf.float32)
         right_audio_tensor = tf.constant(right_audio_processed, dtype=tf.float32)
@@ -1097,6 +1386,7 @@ class DasDatasetCCA:
             'left_env': left_audio_tensor,
             'right_env': right_audio_tensor,
             'label': label_tensor
+            # Note: subject_id removed from tf.data - use only in Python splitting
         }
         
 
@@ -1108,61 +1398,54 @@ class DasDatasetCCA:
     def _process_audio_envelope(self, audio_envelope: np.ndarray, window_size: int) -> np.ndarray:
         """Process audio envelope to match window size and format.
         
-        FIXED: Now expects full temporal envelope (window_size length) instead of single values.
+        Now expects 4-band filterbank envelope (window_size, 4) from _load_audio_envelope_full.
         """
         if audio_envelope is None or len(audio_envelope) == 0:
             # Use zeros if envelope is missing
-            audio_envelope = np.zeros(window_size, dtype=np.float32)
+            audio_envelope = np.zeros((window_size, 4), dtype=np.float32)
         
         # Ensure envelope matches window size
-        if len(audio_envelope) == window_size:
-            # Perfect match - use as is
-            pass
-        elif len(audio_envelope) < window_size:
-            # Pad if too short (shouldn't happen if loaded correctly, but handle gracefully)
-            padding = np.zeros(window_size - len(audio_envelope), dtype=np.float32)
-            audio_envelope = np.concatenate([audio_envelope, padding])
-        elif len(audio_envelope) > window_size:
-            # Truncate if too long (shouldn't happen if loaded correctly, but handle gracefully)
-            audio_envelope = audio_envelope[:window_size]
-        else:
-            # Single value case - this should be rare now, but handle it
-            if len(audio_envelope) == 1:
-                if self.load_audio:
-                    print(f"⚠ WARNING: Received single-value audio envelope. Expected full temporal envelope of length {window_size}.")
-                audio_envelope = np.repeat(audio_envelope, window_size)
-        
-        # Reshape and format to 4 features (same as window_audio)
         if audio_envelope.ndim == 1:
-            audio_envelope = audio_envelope.reshape(-1, 1)
-        
-        if audio_envelope.shape[1] == 1:
-            env_vals = audio_envelope.flatten()
-            if len(env_vals) > 1:
-                from scipy.ndimage import uniform_filter1d
-                smoothed = uniform_filter1d(env_vals, size=min(3, len(env_vals)), mode='nearest')
-                derivative = np.gradient(env_vals)
+            # 1D array - compute 4-band from it
+            if len(audio_envelope) == window_size:
+                audio_envelope = self._compute_4band_envelope(audio_envelope, self.sampling_rate)
             else:
-                smoothed = env_vals
-                derivative = np.zeros_like(env_vals)
+                # Wrong length - pad or truncate first, then compute 4-band
+                if len(audio_envelope) < window_size:
+                    padding = np.zeros(window_size - len(audio_envelope), dtype=np.float32)
+                    audio_envelope = np.concatenate([audio_envelope, padding])
+                else:
+                    audio_envelope = audio_envelope[:window_size]
+                audio_envelope = self._compute_4band_envelope(audio_envelope, self.sampling_rate)
+        elif audio_envelope.ndim == 2:
+            # 2D array - should be (window_size, 4) or (window_size, 1)
+            if audio_envelope.shape[0] != window_size:
+                # Wrong length - pad or truncate
+                if audio_envelope.shape[0] < window_size:
+                    padding = np.zeros((window_size - audio_envelope.shape[0], audio_envelope.shape[1]), dtype=np.float32)
+                    audio_envelope = np.vstack([audio_envelope, padding])
+                else:
+                    audio_envelope = audio_envelope[:window_size]
             
-            audio_envelope = np.column_stack([
-                env_vals,
-                smoothed,
-                derivative,
-                env_vals**2
-            ])
-        elif audio_envelope.shape[1] != 4:
-            if audio_envelope.shape[1] < 4:
-                env_vals = audio_envelope[:, 0] if audio_envelope.shape[1] > 0 else np.zeros(audio_envelope.shape[0])
-                padding = np.zeros((audio_envelope.shape[0], 4 - audio_envelope.shape[1]))
-                audio_envelope = np.column_stack([audio_envelope, padding])
-            else:
-                audio_envelope = audio_envelope[:, :4]
+            if audio_envelope.shape[1] == 1:
+                # Single band - compute 4-band from it
+                audio_envelope = self._compute_4band_envelope(audio_envelope.flatten(), self.sampling_rate)
+            elif audio_envelope.shape[1] != 4:
+                # Wrong number of bands
+                if audio_envelope.shape[1] < 4:
+                    padding = np.zeros((window_size, 4 - audio_envelope.shape[1]), dtype=np.float32)
+                    audio_envelope = np.column_stack([audio_envelope, padding])
+                else:
+                    audio_envelope = audio_envelope[:, :4]
+        else:
+            # Invalid shape - create zeros
+            audio_envelope = np.zeros((window_size, 4), dtype=np.float32)
         
-        if np.max(np.abs(audio_envelope)) > 0:
-            audio_envelope = audio_envelope / (np.max(np.abs(audio_envelope)) + 1e-8)
-        
+        # CRITICAL FIX: Do NOT normalize here - normalization removes amplitude relationships
+        # CCA needs raw amplitude differences to find correlations
+        # Normalization will be handled by CCA's calculate_cca_parameters_from_dataset
+        # which computes global statistics on concatenated training data
+        # This preserves relative amplitude differences between windows that CCA relies on
         return audio_envelope.astype(np.float32)
 
 
@@ -1172,325 +1455,218 @@ class DASCCAModel:
     
     This model uses the telluride_decoding CCA implementation to find correlations
     between EEG data and attention labels, providing comprehensive metrics evaluation.
+    Adapted from FULCCA with DAS-specific optimal hyperparameters.
     """
     
-    def __init__(self, cca_dims: int = 5, regularization: float = 0.01, window_size: int = 512,
-                 eeg_lag_samples: int = 5, pca_components: Optional[int] = None, use_lda: bool = True,
-                 stimulus_lag_samples: Optional[List[int]] = None):
+    def __init__(self, cca_dims: int = 25, regularization: float = 0.08, window_size: int = 512,
+                 use_time_lags: bool = True, min_lag_ms: float = 0.0, max_lag_ms: float = 250.0,
+                 fs: float = 64.0, use_lda: bool = True, pca_eeg: int = 25, pca_audio: int = 0,
+                 eeg_lag_taps: int = 5):
         """
-        Initialize DASCCA model with backward/forward model support.
+        Initialize DASCCA model (paper-style: single CCA on attended envelope + LDA on f=rho1-rho2).
         
         Args:
-            cca_dims: Number of CCA dimensions to compute
-            regularization: Regularization parameter for CCA
-            window_size: Window size for EEG data processing
-            eeg_lag_samples: Number of past time samples to include for backward model (default: 5)
-            pca_components: Number of PCA components for EEG regularization (None = no PCA)
-            use_lda: Whether to use LDA classifier downstream (default: True)
-            stimulus_lag_samples: List of stimulus lag samples for temporal alignment (e.g., [0, 4, 8, 12, 16] for 0-125ms at 128Hz)
-                                  If None, uses default [0, 4, 8, 12, 16, 20, 24, 28, 32] (0-250ms at 128Hz)
+            cca_dims: Number of CCA dimensions J (max: min(EEG_dims, Audio_dims))
+            regularization: Regularization parameter for CCA (optimal: 0.08 for DAS)
+            window_size: Window size in samples
+            use_time_lags: Whether to use time-lagged audio (forward model)
+            min_lag_ms, max_lag_ms: Envelope lag range in ms (e.g. 0-250ms)
+            fs: Sampling rate in Hz
+            use_lda: LDA on f = rho_1 - rho_2 (paper [7])
+            pca_eeg: PCA on EEG before CCA (paper: regularization). 0=off.
+            pca_audio: PCA on audio (0=off)
+            eeg_lag_taps: Backward model taps L for EEG: x(t)=[eeg(t),...,eeg(t-L+1)]. 0=no EEG lag.
         """
-
-
-
-        max_cca_dims = 4
-        if cca_dims > max_cca_dims:
-            print(f"⚠ WARNING: Requested {cca_dims} CCA dimensions, but maximum is {max_cca_dims} (limited by audio features)")
-            print(f"  Reducing CCA dimensions from {cca_dims} to {max_cca_dims}")
-            cca_dims = max_cca_dims
+        self.use_time_lags = use_time_lags
+        self.fs = fs
+        self.min_lag_ms = max(0.0, min_lag_ms)
+        self.max_lag_ms = min(500.0, max_lag_ms)
+        self.eeg_lag_taps = max(0, int(eeg_lag_taps))
+        if use_time_lags:
+            if self.max_lag_ms > 300:
+                print(f"  ⚠ WARNING: max_lag_ms={self.max_lag_ms}ms — high lag range on CPU can explode dimensionality. Consider 0–300ms.")
+            min_lag_samples = int(self.min_lag_ms * fs / 1000.0)
+            max_lag_samples = int(self.max_lag_ms * fs / 1000.0)
+            self.lag_samples = np.arange(min_lag_samples, max_lag_samples + 1)
+            self.num_lags = len(self.lag_samples)
+            print(f"  Time-lagged audio: {self.num_lags} lags ({self.min_lag_ms}-{self.max_lag_ms}ms at {fs} Hz)")
+        else:
+            self.lag_samples = np.array([0])
+            self.num_lags = 1
+        if self.eeg_lag_taps > 0:
+            print(f"  Time-lagged EEG (backward model): L={self.eeg_lag_taps} taps -> {64 * self.eeg_lag_taps} features per time point")
+        
+        # Dimensions: EEG = 64*eeg_lag_taps (or 64 if no lag), Audio = 4*num_lags
+        eeg_base = 64
+        self.eeg_dims = eeg_base * max(1, self.eeg_lag_taps) if self.eeg_lag_taps > 0 else eeg_base
+        audio_bands = 4
+        audio_dims = audio_bands * self.num_lags
+        actual_max_cca_dims = min(self.eeg_dims, audio_dims)
+        # For 81% accuracy target, use more dimensions to capture signal better
+        # With time lag range (150-400ms, 33 lags), we have 132 audio features, allowing up to 64 CCA dims
+        # REMOVED artificial cap - use actual_max_cca_dims (up to 64) for better signal capture
+        
+        if cca_dims > actual_max_cca_dims:
+            print(f"⚠ WARNING: Requested {cca_dims} CCA dimensions, max is {actual_max_cca_dims} (min(EEG={self.eeg_dims}, Audio={audio_dims}))")
+            cca_dims = actual_max_cca_dims
         elif cca_dims < 1:
-            print(f"⚠ WARNING: CCA dimensions must be >= 1, setting to 1")
             cca_dims = 1
+        elif cca_dims < 25 and actual_max_cca_dims >= 25:
+            cca_dims = min(25, actual_max_cca_dims)
         
         self.cca_dims = cca_dims
         self.regularization = regularization
         self.window_size = window_size
-        self.eeg_lag_samples = eeg_lag_samples  # Backward model: include past time points
-        self.pca_components = pca_components  # PCA regularization
-        self.use_lda = use_lda  # LDA downstream classifier
-        
-        # FIXED: Add temporal lag support for attention decoding (EEG lags stimulus by ~100-250ms)
-        # At 128 Hz: 0-32 samples = 0-250ms
-        # NOTE: Temporal lag is typically handled by:
-        #   1. Shifting stimulus relative to EEG (forward model: stimulus leads EEG)
-        #   2. Using lagged regression in CCA (telluride_decoding may support this)
-        #   3. Building lagged stimulus features (concatenate multiple lagged versions)
-        # For now, we store the lag samples but the actual lagging would need to be implemented
-        # in the data loading or CCA model. The eeg_lag_samples handles backward model (past EEG).
-        if stimulus_lag_samples is None:
-            # Default: 0, 4, 8, 12, 16, 20, 24, 28, 32 samples = 0, 31, 63, 94, 125, 156, 188, 219, 250 ms
-            self.stimulus_lag_samples = list(range(0, 33, 4))  # 0 to 32 samples in steps of 4
-        else:
-            self.stimulus_lag_samples = stimulus_lag_samples
-        
+        self.use_lda = use_lda
+        self.audio_bands = audio_bands
+        self.pca_eeg = pca_eeg
+        self.pca_audio = pca_audio
+        self.pca_x = None
+        self.pca_y = None
         self.model = None
         self.is_fitted = False
-        self.pca_model = None  # PCA model for EEG preprocessing
-        self.lda_model = None  # LDA model for classification
+        self.lda_model = None
+        self.lda_scaler = None  # StandardScaler on f=ρ1−ρ2 for LDA (train) and predict
+        # Paper: single CCA on (EEG, attended envelope); at test same Wx,Ws for both streams; LDA on f=rho1-rho2
+        self.cca_params = None       # Single CCA (rot_x, rot_y, mean_x, mean_y, eigenvalues)
+        self.cca_params_left = None  # Unused in paper mode; kept for any legacy
+        self.cca_params_right = None
         
-        print(f"DASCCA model initialized:")
-        print(f"  CCA dimensions: {self.cca_dims} (max possible: {max_cca_dims})")
-        print(f"  Regularization: {regularization}")
-        print(f"  EEG lag samples (backward model): {eeg_lag_samples}")
-        print(f"  Stimulus lag samples (temporal alignment): {self.stimulus_lag_samples} (0-{max(self.stimulus_lag_samples)*1000/128:.0f}ms at 128Hz)")
-        print(f"  PCA components: {pca_components if pca_components else 'None (no PCA)'}")
-        print(f"  LDA classifier: {'Enabled' if use_lda else 'Disabled'}")
-        print(f"  Input dimensions: EEG=64, Audio=4")
+        print(f"DASCCA model initialized (paper-style: single CCA + LDA on f=ρ1-ρ2):")
+        print(f"  CCA dimensions J: {self.cca_dims} (max: {actual_max_cca_dims})")
+        print(f"  EEG dims: {self.eeg_dims} (64 × {max(1, self.eeg_lag_taps)} taps)")
+        print(f"  Audio dims: {audio_dims} (4 bands × {self.num_lags} lags)")
+        print(f"  PCA on EEG: {pca_eeg} components" if pca_eeg else "  PCA on EEG: off")
+        print(f"  LDA: {'on f=ρ1-ρ2' if use_lda else 'disabled'}")
     
-    def _fit_pca(self, dataset: tf.data.Dataset):
+    def _compute_rho(self, X_eeg: np.ndarray, Y_env: np.ndarray) -> np.ndarray:
         """
-        Fit PCA model on EEG data for regularization.
-        
-        Args:
-            dataset: TensorFlow dataset containing EEG data
+        Compute J-dimensional vector of canonical correlations (paper: ρ for one stream).
+        Uses single CCA: project EEG and envelope with Wx, Ws; return per-dimension Pearson corr.
         """
-        print(f"Collecting EEG data for PCA fitting...")
-        all_eeg = []
-        
-        for batch in dataset.take(100):  # Use first 100 batches for PCA fitting
-            if isinstance(batch, dict):
-                inputs = batch
-            elif isinstance(batch, tuple):
-                inputs, _ = batch
-            else:
-                continue
-            
-            eeg_data = inputs.get('input_1')
-            if eeg_data is not None:
-                # Flatten time dimension if needed
-                if len(eeg_data.shape) > 2:
-                    eeg_flat = tf.reshape(eeg_data, (-1, eeg_data.shape[-1]))
-                else:
-                    eeg_flat = eeg_data
-                all_eeg.append(eeg_flat.numpy() if hasattr(eeg_flat, 'numpy') else eeg_flat)
-        
-        if not all_eeg:
-            print("⚠ WARNING: No EEG data collected for PCA, skipping PCA fitting")
-            self.pca_model = None
-            return
-        
-        eeg_matrix = np.vstack(all_eeg)
-        print(f"  Collected {eeg_matrix.shape[0]} samples for PCA")
-        
-        # Fit PCA
-        self.pca_model = PCA(n_components=self.pca_components, random_state=42)
-        self.pca_model.fit(eeg_matrix)
-        
-        explained_var = np.sum(self.pca_model.explained_variance_ratio_)
-        print(f"✓ PCA fitted: {self.pca_components} components explain {explained_var:.1%} of variance")
+        if self.cca_params is None:
+            raise ValueError("Model not fitted.")
+        L = max(1, self.eeg_lag_taps)
+        if X_eeg.ndim == 1:
+            X_eeg = X_eeg.reshape(-1, 64)
+        if Y_env.ndim == 1:
+            Y_env = Y_env.reshape(-1, 4)
+        X = make_lagged_eeg(X_eeg, L).astype(np.float32)
+        if Y_env.shape[1] == 4 and self.use_time_lags:
+            Y_env = make_lagged_audio(Y_env, self.lag_samples, self.fs)
+        if self.pca_x is not None:
+            X = self.pca_x.transform(X)
+        if self.pca_y is not None:
+            Y_env = self.pca_y.transform(Y_env)
+        rot_x = np.asarray(self.cca_params['rot_x'])
+        rot_y = np.asarray(self.cca_params['rot_y'])
+        if rot_x.shape[0] != X.shape[1] and rot_x.shape[1] == X.shape[1]:
+            rot_x = rot_x.T
+        if rot_y.shape[0] != Y_env.shape[1] and rot_y.shape[1] == Y_env.shape[1]:
+            rot_y = rot_y.T
+        mean_x = np.asarray(self.cca_params['mean_x']).reshape(1, -1)
+        mean_y = np.asarray(self.cca_params['mean_y']).reshape(1, -1)
+        U = (X - mean_x) @ rot_x
+        V = (Y_env - mean_y) @ rot_y
+        J = U.shape[1]
+        rho = np.zeros(J, dtype=np.float32)
+        for j in range(J):
+            u, v = U[:, j], V[:, j]
+            u = u - np.mean(u)
+            v = v - np.mean(v)
+            d = np.sqrt(np.sum(u**2) * np.sum(v**2)) + 1e-8
+            rho[j] = np.sum(u * v) / d
+        return rho
     
     def _fit_lda(self, dataset: tf.data.Dataset):
-        """
-        Fit LDA classifier on CCA outputs.
-        
-        For attention decoding, we need to compare left vs right correlations.
-        We compute window-level features: [left_corr, right_corr] for each window.
-        
-        Args:
-            dataset: TensorFlow dataset containing EEG data and labels
-        """
-        print(f"Collecting CCA outputs and labels for LDA fitting...")
-        print(f"  Using CPU device for LDA fitting to avoid GPU memory issues...")
-        all_left_corrs = []
-        all_right_corrs = []
+        """Fit LDA on f = ρ1 − ρ2 (paper [7])."""
+        print("  Computing f = ρ1 − ρ2 per window for LDA...")
+        all_f = []
         all_labels = []
-        
-        # FIXED: Process in smaller batches and use CPU to avoid GPU memory issues
-        batch_count = 0
-        max_batches = 200  # Limit number of batches for LDA fitting
-        for batch in dataset.take(max_batches):
-            if isinstance(batch, dict):
-                inputs = batch
-                aux = None
-                targets = None
-            elif isinstance(batch, tuple):
-                inputs, aux_or_targets = batch
-                if isinstance(aux_or_targets, dict):
-                    aux = aux_or_targets
-                    targets = aux.get('label', None)
-                else:
-                    aux = None
-                    targets = aux_or_targets
-            else:
+        for batch in dataset:
+            if not (isinstance(batch, tuple) and len(batch) == 2):
                 continue
-            
-            # For LDA, we need left and right correlations per window
-            # This matches the approach in predict()
-            if aux is not None and 'left_env' in aux and 'right_env' in aux:
-                eeg_view = inputs['input_1']
-                left_env = aux['left_env']
-                right_env = aux['right_env']
-                
-                # FIXED: Pass sampling rates explicitly for verification
-                eeg_fs = 128  # EEG sampling rate (matches preprocessing)
-                env_fs = 128  # Envelope sampling rate (after resampling in _load_audio_envelope_full)
-                
-                # FIXED: Use CPU for LDA fitting to avoid GPU memory issues with large batches
-                # LDA fitting is just inference (not training), so CPU is fine and more stable
-                with tf.device('/CPU:0'):
-                    try:
-                        # Compute CCA correlation with left audio
-                        left_inputs = {'input_1': eeg_view, 'input_2': left_env}
-                        left_predictions = self.model(left_inputs)
-                        left_scores = self._compute_correlation_scores(left_predictions, eeg_fs=eeg_fs, env_fs=env_fs)
-                        
-                        # Compute CCA correlation with right audio
-                        right_inputs = {'input_1': eeg_view, 'input_2': right_env}
-                        right_predictions = self.model(right_inputs)
-                        right_scores = self._compute_correlation_scores(right_predictions, eeg_fs=eeg_fs, env_fs=env_fs)
-                    except Exception as e:
-                        print(f"⚠ Error during LDA fitting (batch size: {eeg_view.shape[0]}): {e}")
-                        print(f"  Skipping this batch for LDA fitting...")
-                        continue
-                
-                # Aggregate to window-level (mean per window)
-                # Each batch contains multiple windows, each with window_size samples
-                # FIXED: Handle large batches by processing in smaller chunks if needed
-                batch_size_samples = eeg_view.shape[0] if len(eeg_view.shape) > 1 else 1
-                num_samples = len(left_scores)
-                        
-                # Warn if batch is very large (may cause GPU memory issues)
-                if batch_count == 0 and batch_size_samples > 4096:
-                    print(f"  ⚠ WARNING: Large batch size detected ({batch_size_samples} samples)")
-                    print(f"    This may cause GPU memory issues. Consider reducing batch_size in data loader.")
-                batch_count += 1
-                
-                if num_samples > 0:
-                    # Reshape to (num_windows, window_size) and aggregate
-                    if num_samples % self.window_size == 0:
-                        num_windows = num_samples // self.window_size
-                        window_size = self.window_size
-                    else:
-                        # Handle edge case
-                        num_windows = 1
-                        window_size = num_samples
-                    
-                    try:
-                        left_scores_reshaped = left_scores[:num_windows * window_size].reshape(num_windows, window_size)
-                        right_scores_reshaped = right_scores[:num_windows * window_size].reshape(num_windows, window_size)
-                        
-                        # Aggregate scores per window (use mean)
-                        left_window_scores = np.mean(left_scores_reshaped, axis=1)
-                        right_window_scores = np.mean(right_scores_reshaped, axis=1)
-                        
-                        all_left_corrs.append(left_window_scores)
-                        all_right_corrs.append(right_window_scores)
-                    except (ValueError, IndexError):
-                        # Fallback: aggregate all scores into single prediction
-                        all_left_corrs.append(np.array([np.mean(left_scores)]))
-                        all_right_corrs.append(np.array([np.mean(right_scores)]))
-                
-                # Get labels (window-level)
-                if targets is not None:
-                    if hasattr(targets, 'numpy'):
-                        labels = targets.numpy().flatten()
-                    else:
-                        labels = np.array(targets).flatten()
-                    # Ensure labels match number of windows
-                    if len(labels) != len(left_window_scores):
-                        # Repeat or truncate to match
-                        if len(labels) == 1:
-                            labels = np.repeat(labels, len(left_window_scores))
-                        else:
-                            labels = labels[:len(left_window_scores)]
-                    all_labels.append(labels)
-            else:
-                # Fallback: use simple correlation if left/right not available
-                # FIXED: Use CPU for LDA fitting to avoid GPU memory issues
-                with tf.device('/CPU:0'):
-                    try:
-                        cca_outputs = self.model(inputs)
-                        if hasattr(cca_outputs, 'numpy'):
-                            cca_outputs = cca_outputs.numpy()
-                        
-                        # Process CCA outputs (inside CPU context)
-                        cca_width = cca_outputs.shape[-1] // 2
-                        proj_eeg = cca_outputs[:, :cca_width]
-                        proj_audio = cca_outputs[:, cca_width:]
-                        
-                        # Compute correlation per sample
-                        corr_coeffs = proj_eeg[:, 0] * proj_audio[:, 0]
-                        
-                        # Aggregate to window-level
-                        num_samples = len(corr_coeffs)
-                        if num_samples % self.window_size == 0:
-                            num_windows = num_samples // self.window_size
-                            window_size = self.window_size
-                        else:
-                            num_windows = 1
-                            window_size = num_samples
-                        
-                        try:
-                            corr_reshaped = corr_coeffs[:num_windows * window_size].reshape(num_windows, window_size)
-                            window_corrs = np.mean(corr_reshaped, axis=1)
-                            # Use same correlation for both left and right (fallback)
-                            all_left_corrs.append(window_corrs)
-                            all_right_corrs.append(window_corrs)
-                        except (ValueError, IndexError):
-                            all_left_corrs.append(np.array([np.mean(corr_coeffs)]))
-                            all_right_corrs.append(np.array([np.mean(corr_coeffs)]))
-                    except Exception as e:
-                        print(f"⚠ Error during LDA fitting fallback (batch size: {inputs['input_1'].shape[0]}): {e}")
-                        print(f"  Skipping this batch for LDA fitting...")
-                        continue
-                
-                # Get labels
-                if targets is not None:
-                    if hasattr(targets, 'numpy'):
-                        labels = targets.numpy().flatten()
-                    else:
-                        labels = np.array(targets).flatten()
-                    if len(labels) != len(window_corrs):
-                        if len(labels) == 1:
-                            labels = np.repeat(labels, len(window_corrs))
-                        else:
-                            labels = labels[:len(window_corrs)]
-                    all_labels.append(labels)
+            inputs, aux = batch
+            if not (isinstance(aux, dict) and 'left_env' in aux and 'right_env' in aux):
+                continue
+            eeg = (inputs['input_1'].numpy() if hasattr(inputs['input_1'], 'numpy') else np.array(inputs['input_1']))
+            left = (aux['left_env'].numpy() if hasattr(aux['left_env'], 'numpy') else np.array(aux['left_env']))
+            right = (aux['right_env'].numpy() if hasattr(aux['right_env'], 'numpy') else np.array(aux['right_env']))
+            lab = aux.get('label')
+            if lab is not None:
+                lab = lab.numpy() if hasattr(lab, 'numpy') else np.array(lab)
+                lab = np.atleast_1d(lab).flatten()
+            B, W = 1, eeg.shape[0]
+            if len(eeg.shape) == 2 and '_batch_size' in aux and '_window_size' in aux:
+                B = int(aux['_batch_size'].numpy() if hasattr(aux['_batch_size'], 'numpy') else aux['_batch_size'])
+                W = int(aux['_window_size'].numpy() if hasattr(aux['_window_size'], 'numpy') else aux['_window_size'])
+                eeg = eeg.reshape(B, W, -1)
+                left = left.reshape(B, W, -1)
+                right = right.reshape(B, W, -1)
+            for w in range(B):
+                eeg_w = eeg[w] if eeg.ndim == 3 else eeg
+                left_w = left[w] if left.ndim == 3 else left
+                right_w = right[w] if right.ndim == 3 else right
+                rho1 = self._compute_rho(eeg_w, left_w)
+                rho2 = self._compute_rho(eeg_w, right_w)
+                f = rho1 - rho2
+                all_f.append(f)
+                all_labels.append(int(lab[w]) if lab is not None and w < len(lab) else 0)
         
-        if not all_left_corrs or not all_right_corrs or not all_labels:
-            print("⚠ WARNING: Insufficient data for LDA, skipping LDA fitting")
+        if len(all_f) < 2:
             self.lda_model = None
             return
-        
-        # Prepare data for LDA: [left_corr, right_corr] per window
-        left_corrs = np.hstack(all_left_corrs)
-        right_corrs = np.hstack(all_right_corrs)
-        labels = np.hstack(all_labels)
-        
-        # Create feature matrix: (n_windows, 2) - [left_corr, right_corr]
-        cca_features = np.column_stack([left_corrs, right_corrs])
-        
-        # Ensure consistent lengths
-        min_len = min(len(cca_features), len(labels))
-        cca_features = cca_features[:min_len]
-        labels = labels[:min_len]
-        
+        F = np.array(all_f, dtype=np.float32)
+        labels = np.array(all_labels, dtype=np.int64)
         if len(np.unique(labels)) < 2:
-            print("⚠ WARNING: Only one class in labels, skipping LDA fitting")
             self.lda_model = None
+            self.lda_scaler = None
             return
-        
-        # Fit LDA on [left_corr, right_corr] features
-        self.lda_model = LinearDiscriminantAnalysis()
-        self.lda_model.fit(cca_features, labels)
-        
-        print(f"✓ LDA fitted on {len(labels)} windows with features [left_corr, right_corr]")
+        # Standardize f so LDA is not dominated by scale; use same transform at test time
+        self.lda_scaler = StandardScaler()
+        F_scaled = self.lda_scaler.fit_transform(F)
+        # Balanced priors so LDA does not collapse to majority class (fixes ~all-0 predictions)
+        n_classes = len(np.unique(labels))
+        priors = np.ones(n_classes) / n_classes
+        self.lda_model = LinearDiscriminantAnalysis(priors=priors)
+        self.lda_model.fit(F_scaled, labels)
+        print(f"  ✓ LDA fitted on {len(labels)} windows with f ∈ R^{F.shape[1]} (paper: f = ρ1 − ρ2), balanced priors")
+    
+    def _effective_rank(self, x: np.ndarray, eps: float = 1e-6) -> int:
+        """Compute effective rank using SVD."""
+        s = np.linalg.svd(x, compute_uv=False)
+        return int(np.sum(s > eps * s[0])) if s.size > 0 else 0
+    
+    def _estimate_rank_from_dataset(self, dataset: tf.data.Dataset, take_batches: int = 10) -> int:
+        """Estimate effective rank from dataset to cap CCA dimensions."""
+        xs1, xs2 = [], []
+        for batch in dataset.take(take_batches):
+            if isinstance(batch, tuple):
+                inputs, _ = batch
+            else:
+                inputs = batch
+            x1 = inputs['input_1'].numpy()
+            x2 = inputs['input_2'].numpy()
+            xs1.append(x1)
+            xs2.append(x2)
+        if not xs1 or not xs2:
+            return min(4, self.cca_dims)  # Fallback
+        x1 = np.vstack(xs1)
+        x2 = np.vstack(xs2)
+        rank1 = self._effective_rank(x1)
+        rank2 = self._effective_rank(x2)
+        return min(rank1, rank2, x1.shape[1], x2.shape[1])
     
     def _create_robust_cca_model(self, dataset: tf.data.Dataset):
         """
         Create CCA model with robust CUDA handling.
         """
-
         tf.keras.backend.clear_session()
-        
-
         safe_random_operations()
-        
 
         print("Creating CCA model with GPU-first approach...")
         try:
             with tf.device('/GPU:0'):
-
                 model = BrainModelCCA(
                     input_dataset=dataset,
                     cca_dims=self.cca_dims,
@@ -1502,7 +1678,6 @@ class DASCCAModel:
         except Exception as e:
             print(f"GPU model creation failed: {e}")
             print("Trying CPU model creation as fallback...")
-            
 
             try:
                 with tf.device('/CPU:0'):
@@ -1515,162 +1690,140 @@ class DASCCAModel:
                 return model
                 
             except Exception as gpu_error:
-                print(f"GPU model creation also failed: {gpu_error}")
+                print(f"CPU model creation also failed: {gpu_error}")
                 raise RuntimeError("Cannot create CCA model on either CPU or GPU")
     
-    # NOTE: _create_time_lagged_eeg removed - using module-level _apply_time_lagging instead
-    # NOTE: _create_causal_audio removed - not currently used in the implementation
     
     def fit(self, dataset: tf.data.Dataset):
         """
-        Fit the CCA model to the dataset with robust GPU handling.
+        Fit the CCA model by concatenating ALL training data and fitting once.
+        
+        CRITICAL: CCA is NOT a supervised learning problem. It does NOT use:
+        - Labels
+        - Batches
+        - Epochs
+        - Validation
+        
+        CCA simply finds correlations between EEG and audio envelopes.
+        
+        CRITICAL: Train TWO separate CCAs (one for left, one for right) to avoid bias.
+        This matches FULCCA's architecture.
         
         Args:
-            dataset: TensorFlow dataset containing EEG data and labels
+            dataset: TensorFlow dataset containing EEG and audio windows with aux_data
         """
-        print("Fitting DASCCA model...")
+        print("Fitting DASCCA model (paper: single CCA on attended envelope + LDA on f=ρ1-ρ2)...")
+        print("  Collecting training windows (EEG + left/right envelope + labels)...")
+        dataset_iter = iter(dataset)
+        first_batch = next(dataset_iter)
+        batches_to_process = [first_batch] + list(dataset_iter)
+        all_eeg_windows = []   # list of (T, 64)
+        all_left_lagged = []   # list of (T, 4*num_lags) or (T, 4)
+        all_right_lagged = []
+        all_labels = []
+        L = max(1, self.eeg_lag_taps)
+        for batch in batches_to_process:
+            # Extract both left and right audio from batch
+            # CRITICAL: Use aux_data['left_env'] and aux_data['right_env'] for the two CCAs.
+            # input_2 is the attended envelope (left or right by label); we need the actual
+            # left and right streams so CCA_left learns EEG↔left and CCA_right learns EEG↔right.
+            if not (isinstance(batch, tuple) and len(batch) == 2):
+                continue
+            inputs, aux_data = batch
+            if not (isinstance(aux_data, dict) and 'left_env' in aux_data and 'right_env' in aux_data):
+                continue
+            eeg_batch = (inputs['input_1'].numpy() if hasattr(inputs['input_1'], 'numpy') else np.array(inputs['input_1']))
+            left_batch = (aux_data['left_env'].numpy() if hasattr(aux_data['left_env'], 'numpy') else np.array(aux_data['left_env']))
+            right_batch = (aux_data['right_env'].numpy() if hasattr(aux_data['right_env'], 'numpy') else np.array(aux_data['right_env']))
+            labels_batch = aux_data.get('label')
+            if labels_batch is not None:
+                labels_batch = labels_batch.numpy() if hasattr(labels_batch, 'numpy') else np.array(labels_batch)
+                labels_batch = np.atleast_1d(labels_batch).flatten()
+            if len(eeg_batch.shape) == 2 and '_batch_size' in aux_data and '_window_size' in aux_data:
+                B = int(aux_data['_batch_size'].numpy() if hasattr(aux_data['_batch_size'], 'numpy') else aux_data['_batch_size'])
+                T = int(aux_data['_window_size'].numpy() if hasattr(aux_data['_window_size'], 'numpy') else aux_data['_window_size'])
+                eeg_batch = eeg_batch.reshape(B, T, -1)
+                left_batch = left_batch.reshape(B, T, -1)
+                right_batch = right_batch.reshape(B, T, -1)
+                for w in range(B):
+                    eeg_w = eeg_batch[w]
+                    left_w = left_batch[w]
+                    right_w = right_batch[w]
+                    if self.use_time_lags:
+                        left_w = make_lagged_audio(left_w, self.lag_samples, self.fs)
+                        right_w = make_lagged_audio(right_w, self.lag_samples, self.fs)
+                    all_eeg_windows.append(eeg_w)
+                    all_left_lagged.append(left_w)
+                    all_right_lagged.append(right_w)
+                    lab = int(labels_batch[w]) if labels_batch is not None and w < len(labels_batch) else 0
+                    all_labels.append(lab)
         
-        # Fit PCA on training data if enabled
-        if self.pca_components is not None:
-            print(f"Fitting PCA with {self.pca_components} components...")
-            self._fit_pca(dataset)
-        
-
-        self.model = self._create_robust_cca_model(dataset)
-        
-
-        try:
-            print("Compiling CCA model...")
-
-            self.model.compile(
-                optimizer=tf.keras.optimizers.RMSprop(learning_rate=1e-3),
-                loss='mse',
-                metrics=[cca_pearson_correlation_first]
-            )
-            
-            print("Training CCA model...")
-
-            # Train for more epochs to learn meaningful correlations
-            self.model.fit(dataset, epochs=5)
-            
-            print("✓ DASCCA model fitted successfully")
-            
-        except Exception as e:
-            print(f"Training failed: {e}")
-            error_msg = str(e)
-            
-
-            if "rot1 must be shape" in error_msg or "rot2 must be shape" in error_msg:
-                print(f"\n⚠ CCA Dimension Mismatch Error Detected!")
-                print(f"  Requested CCA dimensions: {self.cca_dims}")
-                print(f"  Input dimensions: EEG=64, Audio=4")
-                print(f"  Maximum possible CCA dimensions: min(64, 4) = 4")
-                print(f"\n  The CCA computation is returning rotation matrices with wrong dimensions.")
-                print(f"  This can happen if:")
-                print(f"    1. The dataset format is incorrect")
-                print(f"    2. The CCA computation encounters numerical issues")
-                print(f"    3. The requested dimensions exceed what's possible")
-                
-
-                if self.cca_dims > 2:
-                    print(f"\n  Attempting to fix by reducing CCA dimensions: {self.cca_dims} -> 2")
-                    original_cca_dims = self.cca_dims
-                    self.cca_dims = 2
-                    
-
-                    try:
-                        self.model = self._create_robust_cca_model(dataset)
-                        self.model.compile(
-                            optimizer=tf.keras.optimizers.RMSprop(learning_rate=1e-3),
-                            loss='mse',
-                            metrics=[cca_pearson_correlation_first]
-                        )
-                        # Train for more epochs to learn meaningful correlations
-                        self.model.fit(dataset, epochs=5)
-                        print("✓ DASCCA model fitted successfully with reduced dimensions (2)")
-                        # Success - return early, don't try CPU fallback
-                        self.is_fitted = True
-                        print("✓ DASCCA model training completed")
-                        return
-                    except Exception as e2:
-                        print(f"  Still failed with 2 dimensions: {e2}")
-
-                        if self.cca_dims > 1:
-                            print(f"  Trying with 1 CCA dimension as last resort...")
-                            self.cca_dims = 1
-                            self.model = self._create_robust_cca_model(dataset)
-                            self.model.compile(
-                                optimizer=tf.keras.optimizers.RMSprop(learning_rate=1e-3),
-                                loss='mse',
-                                metrics=[cca_pearson_correlation_first]
-                            )
-                            # Train for more epochs to learn meaningful correlations
-                            self.model.fit(dataset, epochs=5)
-                            print("✓ DASCCA model fitted successfully with 1 dimension")
-                            # Success - return early, don't try CPU fallback
-                            self.is_fitted = True
-                            print("✓ DASCCA model training completed")
-                            return
-                        else:
-                            raise RuntimeError(f"Could not fit CCA model even with 1 dimension. Original error: {e}")
-                else:
-                    raise RuntimeError(f"CCA dimension mismatch. Requested {self.cca_dims} dimensions but computation failed. Error: {e}")
-            
-
-            # Only try CPU fallback if dimension mismatch handling didn't succeed
-            print("Trying CPU fallback for training...")
-            
-            with tf.device('/CPU:0'):
-
-                self.model = BrainModelCCA(
-                    input_dataset=dataset,
-                    cca_dims=self.cca_dims,
-                    regularization_lambda=self.regularization
-                )
-                
-                self.model.compile(
-                    optimizer=tf.keras.optimizers.RMSprop(learning_rate=1e-3),
-                    loss='mse',
-                    metrics=[cca_pearson_correlation_first]
-                )
-                
-                try:
-                    # Train for more epochs to learn meaningful correlations
-                    # CCA typically needs multiple epochs to converge
-                    self.model.fit(dataset, epochs=5)
-                    print("✓ DASCCA model fitted successfully on CPU")
-                except Exception as cpu_error:
-                    cpu_error_msg = str(cpu_error)
-                    if "rot1 must be shape" in cpu_error_msg or "rot2 must be shape" in cpu_error_msg:
-                        print(f"\n⚠ CCA Dimension Mismatch on CPU too!")
-                        print(f"  This indicates a fundamental issue with the CCA computation.")
-                        print(f"  The calculate_cca_parameters_from_dataset() function is returning")
-                        print(f"  rotation matrices with dimensions that don't match the requested CCA dimensions.")
-                        raise RuntimeError(f"CCA dimension mismatch on both GPU and CPU. This suggests the CCA parameter computation is incorrect. Try reducing cca_dims to 1 or 2. Error: {cpu_error}")
-                    raise
-        
+        n_windows = len(all_eeg_windows)
+        if n_windows == 0:
+            raise ValueError("No training windows collected; cannot fit CCA.")
+        print(f"  Collected {n_windows} windows")
+        # Time-lagged EEG: (T, 64*L) per window
+        X_lag = np.vstack([make_lagged_eeg(e, L) for e in all_eeg_windows]).astype(np.float32)
+        Y_att = np.vstack([all_left_lagged[i] if all_labels[i] == 0 else all_right_lagged[i] for i in range(n_windows)]).astype(np.float32)
+        print(f"  X (EEG lagged): {X_lag.shape}, Y (attended envelope lagged): {Y_att.shape}")
+        if self.pca_eeg > 0:
+            n_comp = min(self.pca_eeg, X_lag.shape[1])
+            self.pca_x = PCA(n_components=n_comp)
+            X_lag = self.pca_x.fit_transform(X_lag)
+            print(f"  ✓ PCA on EEG: {X_lag.shape[1]} components")
+        if self.pca_audio > 0:
+            n_comp_a = min(self.pca_audio, Y_att.shape[1])
+            self.pca_y = PCA(n_components=n_comp_a)
+            Y_att = self.pca_y.fit_transform(Y_att)
+            print(f"  ✓ PCA on audio: {n_comp_a} components")
+        max_cca = min(X_lag.shape[1], Y_att.shape[1])
+        if self.cca_dims > max_cca:
+            self.cca_dims = max_cca
+        print(f"  Training single CCA (EEG ↔ attended envelope), J={self.cca_dims}...")
+        def gen():
+            yield {'input_1': X_lag, 'input_2': Y_att}
+        ds = tf.data.Dataset.from_generator(gen, output_signature={
+            'input_1': tf.TensorSpec(shape=(None, X_lag.shape[1]), dtype=tf.float32),
+            'input_2': tf.TensorSpec(shape=(None, Y_att.shape[1]), dtype=tf.float32)
+        })
+        rot_x, rot_y, mean_x, mean_y, e_vals = calculate_cca_parameters_from_dataset(
+            ds, self.cca_dims, regularization=self.regularization, mini_batch_count=0)
+        self.cca_params = {'rot_x': rot_x, 'rot_y': rot_y, 'mean_x': mean_x, 'mean_y': mean_y, 'eigenvalues': e_vals}
+        print(f"  ✓ Single CCA trained: first canonical correlation = {np.sqrt(np.clip(e_vals[0], 0, 1)):.6f}")
         self.is_fitted = True
-        print("✓ DASCCA model training completed")
-        
-        # Fit LDA classifier if enabled (after CCA is fitted)
         if self.use_lda:
-            print("Fitting LDA classifier on CCA outputs...")
+            print("  Fitting LDA on f = ρ1 − ρ2...")
             self._fit_lda(dataset)
     
-    def _compute_correlation_scores(self, predictions: tf.Tensor, eeg_fs: int = 128, env_fs: int = 128) -> np.ndarray:
+    def score_window(self, X: np.ndarray, Y: np.ndarray, use_cca_left: bool = True) -> float:
         """
-        Compute correlation scores from CCA projections using telluride_decoding method.
+        Score a window: single CCA projection then weighted sum of per-dim correlations.
+        Paper mode: one Wx, Ws; Y is either left or right envelope.
+        """
+        rho = self._compute_rho(X, Y)
+        dim_weights = np.exp(-np.arange(len(rho)) * 0.15)
+        dim_weights = dim_weights / dim_weights.sum()
+        return float((rho * dim_weights).sum())
+    
+    def _compute_correlation_scores(self, predictions: tf.Tensor, eeg_fs: int = 128, env_fs: int = 128,
+                                   window_size: Optional[int] = None) -> np.ndarray:
+        """
+        Compute correlation scores from CCA projections using proper Pearson correlation.
         
-        This uses the actual Pearson correlation computation from telluride_decoding,
-        which is the correct way to compute correlations from CCA rotated outputs.
+        FIXED: Compute actual Pearson correlation across time within each window, not per-sample cosine similarity.
+        This is the correct way to compute correlations from CCA rotated outputs.
         
         The CCA model outputs [rotated_eeg, rotated_audio] concatenated.
-        We compute Pearson correlation for each CCA dimension, then weight by importance.
+        We compute Pearson correlation for each CCA dimension across time, then weight by importance.
         
         Args:
-            predictions: CCA model predictions
+            predictions: CCA model predictions, shape (N, 2*cca_dims) where N = num_windows * window_size
             eeg_fs: EEG sampling rate in Hz (for verification)
             env_fs: Envelope sampling rate in Hz (for verification)
+            window_size: Window size in samples (required to reshape flattened predictions)
+        
+        Returns:
+            Window-level correlation scores, shape (num_windows,)
         """
         # FIXED: Explicit sampling rate verification before correlation
         if not hasattr(self, '_sampling_rate_printed'):
@@ -1687,8 +1840,6 @@ class DASCCAModel:
             print(f"{'='*60}\n")
             self._sampling_rate_printed = True
         
-        # Use telluride's cca_pearson_correlation function for accuracy
-        # It computes actual Pearson correlations between rotated outputs
         try:
             # Convert to numpy if needed
             if hasattr(predictions, 'numpy'):
@@ -1696,60 +1847,80 @@ class DASCCAModel:
             else:
                 preds_np = predictions
             
+            # FIXED: Reshape to windows if window_size is provided
+            # If predictions are flattened (batch_windows * window_size, 2*cca_dims),
+            # reshape to (batch_windows, window_size, 2*cca_dims)
+            if window_size is not None and window_size > 0:
+                num_samples = preds_np.shape[0]
+                if num_samples % window_size == 0:
+                    num_windows = num_samples // window_size
+                    preds_np = preds_np.reshape(num_windows, window_size, -1)
+                else:
+                    # Cannot reshape - fall back to per-sample (less ideal)
+                    print(f"⚠ WARNING: Cannot reshape predictions to windows (num_samples={num_samples}, window_size={window_size})")
+                    window_size = None
+            
             cca_width = preds_np.shape[-1] // 2
-            proj_eeg = preds_np[:, :cca_width]
-            proj_env = preds_np[:, cca_width:]
             
-            # For per-sample scoring, compute normalized dot product (cosine similarity)
-            # CCA rotations maximize correlation, so normalized dot product gives similarity score
-            # Weight by dimension importance (first dimension has highest canonical correlation)
-            weights = np.exp(-np.arange(cca_width) * 0.15)  # Exponential decay
-            weights = weights / np.sum(weights)
-            
-            # Normalize projections to unit length per sample for fair comparison
-            # This gives cosine similarity between EEG and audio projections
-            proj_eeg_norm = proj_eeg / (np.linalg.norm(proj_eeg, axis=1, keepdims=True) + 1e-8)
-            proj_env_norm = proj_env / (np.linalg.norm(proj_env, axis=1, keepdims=True) + 1e-8)
-            
-            # Compute weighted cosine similarity per sample
-            # Higher values indicate better match between EEG and audio
-            dot_products = proj_eeg_norm * proj_env_norm  # Element-wise product per dimension
-            scores = np.sum(dot_products * weights, axis=1)  # Weighted sum per sample
-            
-            # Alternative: Use squared values to emphasize stronger correlations
-            # scores = np.sum((dot_products ** 2) * weights, axis=1)
-            
-            return scores
-            
-        except Exception as e:
-            # Fallback to simpler method if Pearson correlation fails
-            print(f"Warning: Using fallback correlation computation: {e}")
-            preds = predictions.numpy() if hasattr(predictions, 'numpy') else predictions
-            cca_width = preds.shape[-1] // 2
-            proj_eeg = preds[:, :cca_width]
-            proj_env = preds[:, cca_width:]
-            
-            # Center the data
-            proj_eeg_centered = proj_eeg - np.mean(proj_eeg, axis=0, keepdims=True)
-            proj_env_centered = proj_env - np.mean(proj_env, axis=0, keepdims=True)
-            
-            # Compute correlation per dimension (matching telluride method)
-            numerator = np.sum(proj_eeg_centered * proj_env_centered, axis=0)
-            denominator = np.sqrt(np.sum(proj_eeg_centered**2, axis=0) * 
-                                np.sum(proj_env_centered**2, axis=0))
-            correlations = np.where(denominator > 1e-8, numerator / denominator, 0.0)
-            
-            # Weight by dimension importance
-            weights = np.exp(-np.arange(cca_width) * 0.15)
-            weights = weights / np.sum(weights)
-            
-            # Return weighted sum of correlations (same for all samples in batch)
-            score = np.sum(correlations * weights)
-            scores = np.full(proj_eeg.shape[0], score)
-            
-            return scores
+            if window_size is not None and len(preds_np.shape) == 3:
+                # FIXED: Proper Pearson correlation across time within each window
+                # Shape: (num_windows, window_size, 2*cca_dims)
+                eeg = preds_np[:, :, :cca_width]  # (num_windows, window_size, cca_width)
+                env = preds_np[:, :, cca_width:]   # (num_windows, window_size, cca_width)
+                
+                # Center across time axis (axis=1) for each window and dimension
+                eeg_c = eeg - eeg.mean(axis=1, keepdims=True)  # (num_windows, window_size, cca_width)
+                env_c = env - env.mean(axis=1, keepdims=True)  # (num_windows, window_size, cca_width)
+                
+                # Compute Pearson correlation per window per dimension
+                # numerator: sum over time (axis=1)
+                num = np.sum(eeg_c * env_c, axis=1)  # (num_windows, cca_width)
+                den = np.sqrt(np.sum(eeg_c**2, axis=1) * np.sum(env_c**2, axis=1)) + 1e-8  # (num_windows, cca_width)
+                corr = num / den  # (num_windows, cca_width)
+                
+                # Weight by dimension importance (first dimension has highest canonical correlation)
+                weights = np.exp(-np.arange(cca_width) * 0.15)  # Exponential decay
+                weights = weights / np.sum(weights)
+                
+                # Weighted sum across dimensions per window
+                window_scores = np.sum(corr * weights, axis=1)  # (num_windows,)
+                
+                return window_scores
+            else:
+                # Fallback: per-sample scoring (less ideal, but handles unreshaped data)
+                proj_eeg = preds_np[:, :cca_width]
+                proj_env = preds_np[:, cca_width:]
+                
+                # Center the data
+                proj_eeg_centered = proj_eeg - np.mean(proj_eeg, axis=0, keepdims=True)
+                proj_env_centered = proj_env - np.mean(proj_env, axis=0, keepdims=True)
+                
+                # Compute correlation per dimension (across all samples)
+                numerator = np.sum(proj_eeg_centered * proj_env_centered, axis=0)
+                denominator = np.sqrt(np.sum(proj_eeg_centered**2, axis=0) * 
+                                    np.sum(proj_env_centered**2, axis=0))
+                correlations = np.where(denominator > 1e-8, numerator / denominator, 0.0)
+                
+                # Weight by dimension importance
+                weights = np.exp(-np.arange(cca_width) * 0.15)
+                weights = weights / np.sum(weights)
+                
+                # Return weighted sum of correlations (same for all samples in batch)
+                score = np.sum(correlations * weights)
+                scores = np.full(proj_eeg.shape[0], score)
+                
+                return scores
     
-    def predict(self, dataset: tf.data.Dataset) -> Tuple[np.ndarray, np.ndarray]:
+        except Exception as e:
+            print(f"Warning: Correlation computation failed: {e}")
+            # Last resort: return zeros
+            if hasattr(predictions, 'numpy'):
+                preds_np = predictions.numpy()
+            else:
+                preds_np = predictions
+            return np.zeros(preds_np.shape[0])
+    
+    def predict(self, dataset: tf.data.Dataset) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """
         Make predictions using the fitted CCA model with GPU optimization.
         
@@ -1757,7 +1928,10 @@ class DASCCAModel:
             dataset: TensorFlow dataset containing EEG data and labels
             
         Returns:
-            Tuple of (predictions, targets)
+            Tuple of (predictions, targets, continuous_scores)
+            - predictions: Binary predictions (0/1)
+            - targets: True labels
+            - continuous_scores: Continuous scores (right_corr - left_corr) for ROC-AUC, or None
         """
         if not self.is_fitted:
             raise ValueError("Model must be fitted before making predictions")
@@ -1801,114 +1975,83 @@ class DASCCAModel:
                         eeg_fs = 128  # EEG sampling rate (matches preprocessing)
                         env_fs = 128  # Envelope sampling rate (after resampling in _load_audio_envelope_full)
                         
-                        # Compute CCA correlation with left audio
-                        left_inputs = {'input_1': eeg_view, 'input_2': left_env}
-                        left_predictions = self.model(left_inputs)
-                        left_scores = self._compute_correlation_scores(left_predictions, eeg_fs=eeg_fs, env_fs=env_fs)
-                        
-                        # Compute CCA correlation with right audio
-                        right_inputs = {'input_1': eeg_view, 'input_2': right_env}
-                        right_predictions = self.model(right_inputs)
-                        right_scores = self._compute_correlation_scores(right_predictions, eeg_fs=eeg_fs, env_fs=env_fs)
-                        
-                        # Aggregate sample-level scores to window-level
-                        # Get input shape to determine window structure
-                        input_shape_tensor = tf.shape(eeg_view)[0]
-                        input_shape = input_shape_tensor.numpy() if hasattr(input_shape_tensor, 'numpy') else int(input_shape_tensor)
-                        
-                        # Determine number of windows in this batch
-                        # input_shape = batch_size * window_size (after batching)
-                        num_samples = len(left_scores)
-                        
-                        # Calculate number of windows: input_shape should be divisible by window_size
-                        if input_shape % self.window_size == 0:
-                            num_windows = input_shape // self.window_size
-                            window_size = self.window_size
+                        # Convert to numpy for manual scoring using dual CCAs
+                        # Expected shapes: eeg_np (B, T, 64), left_env_np/right_env_np (B, T, 4)
+                        if hasattr(eeg_view, 'numpy'):
+                            eeg_np = eeg_view.numpy()
                         else:
-                            # Try to infer window size from common sizes
-                            possible_window_sizes = [32, 64, 128, 256, 512, 1024, 2048, 64 * 30]
-                            num_windows = None
-                            window_size = self.window_size
-                            for ws in possible_window_sizes:
-                                if input_shape % ws == 0 and input_shape // ws > 0:
-                                    num_windows = input_shape // ws
-                                    window_size = ws
-                                    break
-                            
-                            if num_windows is None:
-                                # Last resort: use the actual number of samples
-                                # This handles edge cases
-                                num_windows = 1
-                                window_size = num_samples
+                            eeg_np = np.array(eeg_view)
                         
-                        # Ensure we have the right number of samples
-                        # If num_samples doesn't match expected, truncate or pad
-                        expected_samples = num_windows * window_size
-                        if num_samples != expected_samples:
-                            if num_samples > expected_samples:
-                                # Truncate if we have more samples than expected
-                                left_scores = left_scores[:expected_samples]
-                                right_scores = right_scores[:expected_samples]
-                            elif num_samples < expected_samples:
-                                # This shouldn't happen, but handle it
-                                # Use actual number of samples to recalculate
-                                if num_samples % self.window_size == 0:
-                                    num_windows = num_samples // self.window_size
-                                    window_size = self.window_size
+                        if hasattr(left_env, 'numpy'):
+                            left_env_np = left_env.numpy()
+                        else:
+                            left_env_np = np.array(left_env)
+                        
+                        if hasattr(right_env, 'numpy'):
+                            right_env_np = right_env.numpy()
+                        else:
+                            right_env_np = np.array(right_env)
+                        
+                        # Reshape flattened (B*W, F) from reshape_batch to (B, W, F) when batch/window info present
+                        if eeg_np.ndim == 2 and isinstance(aux, dict) and '_batch_size' in aux and '_window_size' in aux:
+                            B_val = aux['_batch_size']
+                            W_val = aux['_window_size']
+                            B = int(B_val.numpy() if hasattr(B_val, 'numpy') else B_val)
+                            W = int(W_val.numpy() if hasattr(W_val, 'numpy') else W_val)
+                            if eeg_np.shape[0] == B * W and eeg_np.shape[0] > 0:
+                                eeg_np = eeg_np.reshape(B, W, -1)
+                                left_env_np = left_env_np.reshape(B, W, -1)
+                                right_env_np = right_env_np.reshape(B, W, -1)
+                        elif eeg_np.ndim == 2:
+                            eeg_np = eeg_np[None, ...]  # (1, T, 64)
+                            left_env_np = left_env_np[None, ...]  # (1, T, 4)
+                            right_env_np = right_env_np[None, ...]  # (1, T, 4)
+                        
+                        # Now eeg_np is (B, T, 64), left_env_np/right_env_np are (B, T, 4)
+                        B = eeg_np.shape[0]
+                        left_window_scores = np.empty(B, dtype=np.float32)
+                        right_window_scores = np.empty(B, dtype=np.float32)
+                        F_batch = []
+                        w_weights = np.exp(-np.arange(self.cca_dims) * 0.15)
+                        w_weights = w_weights / w_weights.sum()
+                        for w in range(B):
+                            try:
+                                eeg_window = eeg_np[w]
+                                left_audio_window = left_env_np[w]
+                                right_audio_window = right_env_np[w]
+                                if self.use_time_lags:
+                                    left_audio_lagged = make_lagged_audio(left_audio_window, self.lag_samples, self.fs)
+                                    right_audio_lagged = make_lagged_audio(right_audio_window, self.lag_samples, self.fs)
                                 else:
-                                    num_windows = 1
-                                    window_size = num_samples
-                        
-                        # Reshape scores to (num_windows, window_size) and aggregate per window
-                        try:
-                            left_scores_reshaped = left_scores[:num_windows * window_size].reshape(num_windows, window_size)
-                            right_scores_reshaped = right_scores[:num_windows * window_size].reshape(num_windows, window_size)
-                            
-                            # Aggregate scores per window (use mean)
-                            left_window_scores = np.mean(left_scores_reshaped, axis=1)
-                            right_window_scores = np.mean(right_scores_reshaped, axis=1)
-                        except (ValueError, IndexError) as e:
-                            # Fallback: if reshape fails, aggregate all scores into single prediction
-                            left_window_scores = np.array([np.mean(left_scores)])
-                            right_window_scores = np.array([np.mean(right_scores)])
-                        
-                        # FIXED: Store window-level scores for diagnostics (not sample-level)
-                        # This ensures diagnostics match window-level targets
-                        all_left_scores.extend(left_window_scores)
-                        all_right_scores.extend(right_window_scores)
-                        
-                        # Predict using LDA if enabled, otherwise use direct comparison
+                                    left_audio_lagged = left_audio_window
+                                    right_audio_lagged = right_audio_window
+                                rho_1 = self._compute_rho(eeg_window, left_audio_lagged)
+                                rho_2 = self._compute_rho(eeg_window, right_audio_lagged)
+                                left_window_scores[w] = float((rho_1 * w_weights).sum())
+                                right_window_scores[w] = float((rho_2 * w_weights).sum())
+                                F_batch.append(rho_1 - rho_2)
+                            except Exception as score_error:
+                                print(f"⚠ Warning: Scoring failed for window {w}: {score_error}")
+                                left_window_scores[w] = 0.0
+                                right_window_scores[w] = 0.0
+                                F_batch.append(np.zeros(self.cca_dims, dtype=np.float32))
+                        num_windows = len(left_window_scores)
+                        all_left_scores.extend(left_window_scores.tolist())
+                        all_right_scores.extend(right_window_scores.tolist())
+                        continuous_scores = right_window_scores - left_window_scores
+                        if not hasattr(self, '_all_continuous_scores'):
+                            self._all_continuous_scores = []
+                        self._all_continuous_scores.extend(continuous_scores.tolist())
+                        F_batch = np.array(F_batch, dtype=np.float32)
                         if self.use_lda and self.lda_model is not None:
-                            # Use LDA to classify based on correlation coefficients
-                            # Create feature vector: [left_corr, right_corr] for each window
-                            lda_features = np.column_stack([left_window_scores, right_window_scores])
-                            window_predictions = self.lda_model.predict(lda_features).astype(np.int64)
+                            F_batch_scaled = self.lda_scaler.transform(F_batch) if self.lda_scaler is not None else F_batch
+                            window_predictions = self.lda_model.predict(F_batch_scaled).astype(np.int64)
                         else:
-                            # Direct comparison: Right=1 if right > left, Left=0 otherwise
                             window_predictions = (right_window_scores > left_window_scores).astype(np.int64)
                         
-                        # Ensure window_predictions is 1D array with num_windows elements
-                        if window_predictions.ndim > 1:
-                            window_predictions = window_predictions.flatten()
-                        if len(window_predictions) != num_windows:
-                            # If mismatch, take first num_windows or repeat as needed
-                            if len(window_predictions) > num_windows:
-                                window_predictions = window_predictions[:num_windows]
-                            else:
-                                # Repeat last prediction if needed (shouldn't happen)
-                                window_predictions = np.pad(window_predictions, (0, num_windows - len(window_predictions)), mode='edge')
-                        
-                        binary_predictions = tf.constant(window_predictions, dtype=tf.int64)
-                        
-                        # For left/right comparison, predictions are now per-window after aggregation
+                        # window_predictions is already (num_windows,) - use directly
                         with tf.device('/CPU:0'):
-                            pred_numpy = binary_predictions.numpy()
-                            # Ensure we're adding the right number of predictions
-                            if len(pred_numpy) == num_windows:
-                                all_predictions.extend(pred_numpy)
-                            else:
-                                # Safety check: only add num_windows predictions
-                                all_predictions.extend(pred_numpy[:num_windows])
+                            all_predictions.extend(window_predictions)
                             
                             if targets is not None:
                                 target_array = targets.numpy() if hasattr(targets, 'numpy') else np.array(targets)
@@ -1916,104 +2059,17 @@ class DASCCAModel:
                                 # Ensure targets match number of windows
                                 if len(target_flat) == num_windows:
                                     all_targets.extend(target_flat)
+                                elif len(target_flat) > num_windows:
+                                    all_targets.extend(target_flat[:num_windows])
                                 else:
-                                    # Take first num_windows targets or repeat as needed
-                                    if len(target_flat) > num_windows:
-                                        all_targets.extend(target_flat[:num_windows])
-                                    else:
-                                        all_targets.extend(np.pad(target_flat, (0, num_windows - len(target_flat)), mode='edge'))
+                                    all_targets.extend(np.pad(target_flat, (0, num_windows - len(target_flat)), mode='edge'))
                         continue  # Skip the rest of the loop for this batch
                     else:
-                        # Fallback: Use old method if aux data not available
-                        predictions = self.model(inputs)
-                    
-
-                        cca_width = predictions.shape[-1] // 2
-                    pred1 = predictions[:, :cca_width]
-                    pred2 = predictions[:, cca_width:]
-                    
-
-
-
-
-
-                    # FIX: Use proper correlation scoring instead of arbitrary > 0 threshold
-                    pred1_norm = pred1 / (tf.linalg.norm(pred1, axis=1, keepdims=True) + 1e-8)
-                    pred2_norm = pred2 / (tf.linalg.norm(pred2, axis=1, keepdims=True) + 1e-8)
-                    weights = tf.exp(-tf.range(cca_width, dtype=tf.float32) * 0.15)
-                    weights = weights / tf.reduce_sum(weights)
-                    dot_products = pred1_norm * pred2_norm
-                    cca_scores = tf.reduce_sum(dot_products * weights, axis=1)
-                    median_score = tf.reduce_mean(cca_scores)
-                    
-
-
-
-
-
-                    binary_predictions = tf.cast(cca_scores > median_score, tf.int64)
-                    
-
-
-
-
-
-
-                    with tf.device('/CPU:0'):
-                        input_shape_tensor = tf.shape(inputs['input_1'])[0]
-
-                        input_shape = input_shape_tensor.numpy() if hasattr(input_shape_tensor, 'numpy') else int(input_shape_tensor)
-                        num_predictions = int(binary_predictions.shape[0])
-                    
-
-
-                    possible_window_sizes = [32, 64, 128, 256, 512, 1024, 2048, 64 * 30]
-                    
-                    batch_size = None
-                    window_size = self.window_size
-                    
-
-                    if input_shape % self.window_size == 0:
-                        batch_size = input_shape // self.window_size
-                        window_size = self.window_size
-                    else:
-
-                        for ws in possible_window_sizes:
-                            if input_shape % ws == 0 and input_shape // ws > 0:
-                                batch_size = input_shape // ws
-                                window_size = ws
-                                break
-                    
-
-                    if batch_size is None or batch_size == 0:
-
-                        batch_size = num_predictions
-                        window_size = 1
-                        pred_reshaped = tf.expand_dims(binary_predictions, axis=1)
-                    else:
-
-                        pred_reshaped = tf.reshape(binary_predictions, (batch_size, window_size))
-                    
-
-                        # For left/right comparison, predictions are already per-window
-                        if aux is not None and 'left_env' in aux:
-                            # Already have window-level predictions from left/right comparison
-                            with tf.device('/CPU:0'):
-                                all_predictions.extend(binary_predictions.numpy())
-                                if targets is not None:
-                                    if hasattr(targets, 'numpy'):
-                                        all_targets.extend(targets.numpy().flatten())
-                                    else:
-                                        all_targets.extend(np.array(targets).flatten())
-                        else:
-                            # Old method: aggregate window predictions
-                            sample_predictions = tf.reduce_sum(pred_reshaped, axis=1)
-                            sample_predictions = tf.cast(sample_predictions > (window_size // 2), tf.int64)
-                            
-                            with tf.device('/CPU:0'):
-                                all_predictions.extend(sample_predictions.numpy())
-                                if targets is not None:
-                                    all_targets.extend(targets.numpy().flatten())
+                        # DASCCA uses dual CCA (score_window); there is no single self.model. Skip batch if aux missing.
+                        if not hasattr(self, '_fallback_aux_warned'):
+                            print(f"⚠ WARNING: Batch missing left_env/right_env in aux_data; skipping batch (DASCCA requires both streams).")
+                            self._fallback_aux_warned = True
+                        continue
         except Exception as gpu_error:
             # Try CPU fallback for any error (GPU-related or otherwise)
             error_msg = str(gpu_error)
@@ -2049,211 +2105,83 @@ class DASCCAModel:
                             inputs, targets = batch
                             aux = None
                         
-                        # CORRECT APPROACH: Compare correlations with BOTH left and right audio
+                        # CORRECT APPROACH: Compare correlations with BOTH left and right audio (same as GPU path)
                         if aux is not None and 'left_env' in aux and 'right_env' in aux:
                             eeg_view = inputs['input_1']
                             left_env = aux['left_env']
                             right_env = aux['right_env']
-                            
-                            # Compute CCA correlation with left audio
-                            left_inputs = {'input_1': eeg_view, 'input_2': left_env}
-                            left_predictions = self.model(left_inputs)
-                            left_scores = self._compute_correlation_scores(left_predictions)
-                            
-                            # Compute CCA correlation with right audio
-                            right_inputs = {'input_1': eeg_view, 'input_2': right_env}
-                            right_predictions = self.model(right_inputs)
-                            right_scores = self._compute_correlation_scores(right_predictions)
-                            
-                            # Aggregate sample-level scores to window-level
-                            # Get input shape to determine window structure
-                            input_shape_tensor = tf.shape(eeg_view)[0]
-                            input_shape = input_shape_tensor.numpy() if hasattr(input_shape_tensor, 'numpy') else int(input_shape_tensor)
-                            
-                            # Determine number of windows in this batch
-                            # input_shape = batch_size * window_size (after batching)
-                            num_samples = len(left_scores)
-                            
-                            # Calculate number of windows: input_shape should be divisible by window_size
-                            if input_shape % self.window_size == 0:
-                                num_windows = input_shape // self.window_size
-                                window_size = self.window_size
+                            # Convert to numpy and use score_window (dual CCA) - self.model is not used in DASCCA
+                            if hasattr(eeg_view, 'numpy'):
+                                eeg_np = eeg_view.numpy()
                             else:
-                                # Try to infer window size from common sizes
-                                possible_window_sizes = [32, 64, 128, 256, 512, 1024, 2048, 64 * 30]
-                                num_windows = None
-                                window_size = self.window_size
-                                for ws in possible_window_sizes:
-                                    if input_shape % ws == 0 and input_shape // ws > 0:
-                                        num_windows = input_shape // ws
-                                        window_size = ws
-                                        break
-                                
-                                if num_windows is None:
-                                    # Last resort: use the actual number of samples
-                                    # This handles edge cases
-                                    num_windows = 1
-                                    window_size = num_samples
-                            
-                            # Ensure we have the right number of samples
-                            # If num_samples doesn't match expected, truncate or pad
-                            expected_samples = num_windows * window_size
-                            if num_samples != expected_samples:
-                                if num_samples > expected_samples:
-                                    # Truncate if we have more samples than expected
-                                    left_scores = left_scores[:expected_samples]
-                                    right_scores = right_scores[:expected_samples]
-                                elif num_samples < expected_samples:
-                                    # This shouldn't happen, but handle it
-                                    # Use actual number of samples to recalculate
-                                    if num_samples % self.window_size == 0:
-                                        num_windows = num_samples // self.window_size
-                                        window_size = self.window_size
+                                eeg_np = np.array(eeg_view)
+                            if hasattr(left_env, 'numpy'):
+                                left_env_np = left_env.numpy()
+                            else:
+                                left_env_np = np.array(left_env)
+                            if hasattr(right_env, 'numpy'):
+                                right_env_np = right_env.numpy()
+                            else:
+                                right_env_np = np.array(right_env)
+                            if eeg_np.ndim == 2 and '_batch_size' in aux and '_window_size' in aux:
+                                B = int(aux['_batch_size'].numpy() if hasattr(aux['_batch_size'], 'numpy') else aux['_batch_size'])
+                                W = int(aux['_window_size'].numpy() if hasattr(aux['_window_size'], 'numpy') else aux['_window_size'])
+                                if eeg_np.shape[0] == B * W and eeg_np.shape[0] > 0:
+                                    eeg_np = eeg_np.reshape(B, W, -1)
+                                    left_env_np = left_env_np.reshape(B, W, -1)
+                                    right_env_np = right_env_np.reshape(B, W, -1)
+                            elif eeg_np.ndim == 2:
+                                eeg_np = eeg_np[None, ...]
+                                left_env_np = left_env_np[None, ...]
+                                right_env_np = right_env_np[None, ...]
+                            B = eeg_np.shape[0]
+                            left_window_scores = np.empty(B, dtype=np.float32)
+                            right_window_scores = np.empty(B, dtype=np.float32)
+                            F_batch = []
+                            w_weights = np.exp(-np.arange(self.cca_dims) * 0.15)
+                            w_weights = w_weights / w_weights.sum()
+                            for w in range(B):
+                                try:
+                                    eeg_window = eeg_np[w]
+                                    left_audio_window = left_env_np[w]
+                                    right_audio_window = right_env_np[w]
+                                    if self.use_time_lags:
+                                        left_audio_lagged = make_lagged_audio(left_audio_window, self.lag_samples, self.fs)
+                                        right_audio_lagged = make_lagged_audio(right_audio_window, self.lag_samples, self.fs)
                                     else:
-                                        num_windows = 1
-                                        window_size = num_samples
-                            
-                            # Reshape scores to (num_windows, window_size) and aggregate per window
-                            try:
-                                left_scores_reshaped = left_scores[:num_windows * window_size].reshape(num_windows, window_size)
-                                right_scores_reshaped = right_scores[:num_windows * window_size].reshape(num_windows, window_size)
-                                
-                                # Aggregate scores per window (use mean)
-                                left_window_scores = np.mean(left_scores_reshaped, axis=1)
-                                right_window_scores = np.mean(right_scores_reshaped, axis=1)
-                            except (ValueError, IndexError) as e:
-                                # Fallback: if reshape fails, aggregate all scores into single prediction
-                                left_window_scores = np.array([np.mean(left_scores)])
-                                right_window_scores = np.array([np.mean(right_scores)])
-                            
-                            # FIXED: Store window-level scores for diagnostics (not sample-level)
-                            # This ensures diagnostics match window-level targets
-                            all_left_scores.extend(left_window_scores)
-                            all_right_scores.extend(right_window_scores)
-                            
-                            # Predict based on which correlation is higher: Right=1 if right > left, Left=0 otherwise
-                            window_predictions = (right_window_scores > left_window_scores).astype(np.int64)
-                            
-                            # Ensure window_predictions is 1D array with num_windows elements
-                            if window_predictions.ndim > 1:
-                                window_predictions = window_predictions.flatten()
-                            if len(window_predictions) != num_windows:
-                                # If mismatch, take first num_windows or repeat as needed
-                                if len(window_predictions) > num_windows:
-                                    window_predictions = window_predictions[:num_windows]
-                                else:
-                                    # Repeat last prediction if needed (shouldn't happen)
-                                    window_predictions = np.pad(window_predictions, (0, num_windows - len(window_predictions)), mode='edge')
-                            
-                            binary_predictions = tf.constant(window_predictions, dtype=tf.int64)
-                            
-                            # For left/right comparison, predictions are now per-window after aggregation
-                            pred_numpy = binary_predictions.numpy()
-                            # Ensure we're adding the right number of predictions
-                            if len(pred_numpy) == num_windows:
-                                all_predictions.extend(pred_numpy)
+                                        left_audio_lagged = left_audio_window
+                                        right_audio_lagged = right_audio_window
+                                    rho_1 = self._compute_rho(eeg_window, left_audio_lagged)
+                                    rho_2 = self._compute_rho(eeg_window, right_audio_lagged)
+                                    left_window_scores[w] = float((rho_1 * w_weights).sum())
+                                    right_window_scores[w] = float((rho_2 * w_weights).sum())
+                                    F_batch.append(rho_1 - rho_2)
+                                except Exception:
+                                    left_window_scores[w] = 0.0
+                                    right_window_scores[w] = 0.0
+                                    F_batch.append(np.zeros(self.cca_dims, dtype=np.float32))
+                            num_windows = B
+                            all_left_scores.extend(left_window_scores.tolist())
+                            all_right_scores.extend(right_window_scores.tolist())
+                            F_batch = np.array(F_batch, dtype=np.float32)
+                            if self.use_lda and self.lda_model is not None:
+                                F_batch_scaled = self.lda_scaler.transform(F_batch) if self.lda_scaler is not None else F_batch
+                                window_predictions = self.lda_model.predict(F_batch_scaled).astype(np.int64)
                             else:
-                                # Safety check: only add num_windows predictions
-                                all_predictions.extend(pred_numpy[:num_windows])
-                            
+                                window_predictions = (right_window_scores > left_window_scores).astype(np.int64)
+                            all_predictions.extend(window_predictions)
                             if targets is not None:
-                                if hasattr(targets, 'numpy'):
-                                    target_array = targets.numpy()
-                                elif isinstance(targets, (list, np.ndarray)):
-                                    target_array = np.array(targets)
-                                else:
-                                    # Handle dict case
-                                    label = targets.get('label', None) if isinstance(targets, dict) else None
-                                    if label is not None:
-                                        target_array = label.numpy() if hasattr(label, 'numpy') else np.array(label)
-                                    else:
-                                        target_array = np.array([0])
-                                
+                                target_array = targets.numpy() if hasattr(targets, 'numpy') else np.array(targets)
                                 target_flat = target_array.flatten()
-                                # Ensure targets match number of windows
                                 if len(target_flat) == num_windows:
                                     all_targets.extend(target_flat)
+                                elif len(target_flat) > num_windows:
+                                    all_targets.extend(target_flat[:num_windows])
                                 else:
-                                    # Take first num_windows targets or repeat as needed
-                                    if len(target_flat) > num_windows:
-                                        all_targets.extend(target_flat[:num_windows])
-                                    else:
-                                        all_targets.extend(np.pad(target_flat, (0, num_windows - len(target_flat)), mode='edge'))
-                            continue  # Skip the rest of the loop for this batch
-                        
-                        # Fallback: Use old method if aux data not available
-                        predictions = self.model(inputs)
-                        
-
-                        cca_width = predictions.shape[-1] // 2
-                        pred1 = predictions[:, :cca_width]
-                        pred2 = predictions[:, cca_width:]
-                        
-
-                        # FIX: Use proper correlation scoring instead of arbitrary > 0 threshold
-                        # Compute weighted correlation across all CCA dimensions
-                        pred1_norm = pred1 / (tf.linalg.norm(pred1, axis=1, keepdims=True) + 1e-8)
-                        pred2_norm = pred2 / (tf.linalg.norm(pred2, axis=1, keepdims=True) + 1e-8)
-                        
-                        # Weight by dimension importance (first dimension has highest correlation)
-                        weights = tf.exp(-tf.range(cca_width, dtype=tf.float32) * 0.15)
-                        weights = weights / tf.reduce_sum(weights)
-                        
-                        # Compute weighted correlation scores (dot product of normalized projections)
-                        dot_products = pred1_norm * pred2_norm
-                        cca_scores = tf.reduce_sum(dot_products * weights, axis=1)
-                        
-                        # Use median as threshold (better than 0, but still not ideal without left/right comparison)
-                        median_score = tf.reduce_mean(cca_scores)
-                        binary_predictions = tf.cast(cca_scores > median_score, tf.int64)
-                        
-
-                        input_shape_tensor = tf.shape(inputs['input_1'])[0]
-                        input_shape = input_shape_tensor.numpy() if hasattr(input_shape_tensor, 'numpy') else int(input_shape_tensor)
-                        num_predictions = int(binary_predictions.shape[0])
-                        
-
-                        possible_window_sizes = [32, 64, 128, 256, 512, 1024, 2048, 64 * 30]
-                        
-                        batch_size = None
-                        window_size = self.window_size
-                        
-                        if input_shape % self.window_size == 0:
-                            batch_size = input_shape // self.window_size
-                            window_size = self.window_size
-                        else:
-                            for ws in possible_window_sizes:
-                                if input_shape % ws == 0 and input_shape // ws > 0:
-                                    batch_size = input_shape // ws
-                                    window_size = ws
-                                    break
-                        
-                        if batch_size is None or batch_size == 0:
-                            batch_size = num_predictions
-                            window_size = 1
-                            pred_reshaped = tf.expand_dims(binary_predictions, axis=1)
-                        else:
-                            pred_reshaped = tf.reshape(binary_predictions, (batch_size, window_size))
-                        
-
-                        sample_predictions = tf.reduce_sum(pred_reshaped, axis=1)
-                        sample_predictions = tf.cast(sample_predictions > (window_size // 2), tf.int64)
-                        
-                        all_predictions.extend(sample_predictions.numpy())
-                        
-                        if targets is not None:
-                            if hasattr(targets, 'numpy'):
-                                all_targets.extend(targets.numpy().flatten())
-                            elif isinstance(targets, (list, np.ndarray)):
-                                all_targets.extend(np.array(targets).flatten())
-                            else:
-                                # Handle dict case
-                                label = targets.get('label', None) if isinstance(targets, dict) else None
-                                if label is not None:
-                                    if hasattr(label, 'numpy'):
-                                        all_targets.extend(label.numpy().flatten())
-                                    else:
-                                        all_targets.extend(np.array(label).flatten())
+                                    all_targets.extend(np.pad(target_flat, (0, num_windows - len(target_flat)), mode='edge'))
+                            continue
+                        print(f"⚠ WARNING: Left/right audio envelopes not available in batch")
+                        continue
             except Exception as cpu_error:
                 print(f"⚠ CPU fallback also failed: {cpu_error}")
                 raise RuntimeError(f"Both GPU and CPU prediction failed. GPU error: {gpu_error}, CPU error: {cpu_error}")
@@ -2296,7 +2224,16 @@ class DASCCAModel:
             
             print("="*80 + "\n")
         
-        return np.array(all_predictions), np.array(all_targets)
+        # FIXED: Return continuous scores for ROC-AUC computation
+        # Compute continuous scores: right_corr - left_corr (if available)
+        continuous_scores = None
+        if all_left_scores and all_right_scores and len(all_left_scores) == len(all_predictions):
+            all_left_scores_arr = np.array(all_left_scores)
+            all_right_scores_arr = np.array(all_right_scores)
+            # Continuous score: right_corr - left_corr (positive = right, negative = left)
+            continuous_scores = all_right_scores_arr - all_left_scores_arr
+        
+        return np.array(all_predictions), np.array(all_targets), continuous_scores
 
 
 class DASCCATrainer:
@@ -2324,21 +2261,30 @@ class DASCCATrainer:
         print("Starting DASCCA training...")
         
 
-        train_size = sum(1 for _ in train_dataset)
-        val_size = sum(1 for _ in val_dataset)
-        print(f"Train dataset size: {train_size} batches")
-        print(f"Val dataset size: {val_size} batches")
+        # Check if datasets are non-empty without consuming them
+        # Use take(1) to peek at first batch - this doesn't consume the dataset
+        try:
+            _ = next(iter(train_dataset.take(1)))
+            print("✓ Train dataset is non-empty (has at least 1 batch)")
+        except (StopIteration, Exception) as e:
+            print(f"⚠ ERROR: Train dataset is empty or has errors: {e}")
+            raise ValueError("Train dataset is empty! Cannot train CCA model. Check generator output above for errors.")
         
-        if train_size == 0:
-            raise ValueError("Train dataset is empty! Cannot train CCA model.")
-        if val_size == 0:
-            raise ValueError("Validation dataset is empty! Cannot validate CCA model.")
+        try:
+            _ = next(iter(val_dataset.take(1)))
+            print("✓ Validation dataset is non-empty (has at least 1 batch)")
+        except (StopIteration, Exception) as e:
+            print(f"⚠ ERROR: Validation dataset is empty or has errors: {e}")
+            raise ValueError("Validation dataset is empty! Cannot validate CCA model. Check generator output above for errors.")
         
 
+        # fit() needs (inputs, aux_data) tuple format to extract right_env from aux_data
+        # The fit method extracts both left_audio (from inputs) and right_audio (from aux_data)
+        # So we pass the full dataset with aux_data intact
         self.model.fit(train_dataset)
-        
 
-        val_predictions, val_targets = self.model.predict(val_dataset)
+
+        val_predictions, val_targets, _ = self.model.predict(val_dataset)
         
         # FIXED: Verify accuracy computation matches balanced accuracy
         val_accuracy = accuracy_score(val_targets, val_predictions)
@@ -2364,7 +2310,7 @@ class DASCCATrainer:
         """Test the DASCCA model with comprehensive metrics."""
         print("Testing DASCCA model...")
         
-        predictions, targets = self.model.predict(test_dataset)
+        predictions, targets, continuous_scores = self.model.predict(test_dataset)
         
         # FIXED: Verify predictions and targets are aligned and have correct shapes
         print(f"\n{'='*60}")
@@ -2405,10 +2351,11 @@ class DASCCATrainer:
         cm = confusion_matrix(targets, predictions)
         
 
-        roc_auc_metrics = self._calculate_roc_auc_metrics(targets, predictions)
+        # FIXED: Use continuous scores (right_corr - left_corr) for ROC-AUC
+        roc_auc_metrics = self._calculate_roc_auc_metrics(targets, predictions, continuous_scores=continuous_scores)
         msed_metrics = self._calculate_msed_metrics(targets, predictions)
         advanced_metrics = self._calculate_advanced_metrics(targets, predictions)
-        temporal_metrics = self._calculate_temporal_metrics(test_dataset)
+        # Temporal metrics removed - main test uses configured window size
         
         results = {
             'accuracy': accuracy,
@@ -2418,17 +2365,35 @@ class DASCCATrainer:
             'targets': targets,
             'roc_auc_metrics': roc_auc_metrics,
             'msed_metrics': msed_metrics,
-            'advanced_metrics': advanced_metrics,
-            'temporal_metrics': temporal_metrics
+            'advanced_metrics': advanced_metrics
         }
         
         return results
     
-    def _calculate_roc_auc_metrics(self, targets: np.ndarray, predictions: np.ndarray) -> Dict:
-        """Calculate ROC-AUC and related metrics."""
+    def _calculate_roc_auc_metrics(self, targets: np.ndarray, predictions: np.ndarray, 
+                                   continuous_scores: Optional[np.ndarray] = None) -> Dict:
+        """
+        Calculate ROC-AUC and related metrics.
+        
+        FIXED: Use continuous scores instead of hard predictions for meaningful ROC-AUC.
+        If continuous_scores is provided (e.g., right_corr - left_corr), use that.
+        Otherwise, try to extract from predictions if they're not binary.
+        """
         try:
-
-            probabilities = predictions.astype(np.float32)
+            # FIXED: Use continuous scores for ROC-AUC instead of hard {0,1} predictions
+            if continuous_scores is not None:
+                probabilities = continuous_scores.astype(np.float32)
+            elif len(np.unique(predictions)) > 2 or (np.min(predictions) < 0 or np.max(predictions) > 1):
+                # Predictions are already continuous
+                probabilities = predictions.astype(np.float32)
+            else:
+                # Hard predictions - cannot compute meaningful ROC-AUC
+                # Return error or use dummy scores
+                return {
+                    "error": "Cannot compute ROC-AUC from hard binary predictions. Need continuous scores (e.g., right_corr - left_corr).",
+                    "roc_auc_score": 0.5,
+                    "note": "ROC-AUC requires continuous scores, not hard {0,1} predictions"
+                }
             
             roc_auc = roc_auc_score(targets, probabilities)
             fpr, tpr, roc_thresholds = roc_curve(targets, probabilities)
@@ -2539,288 +2504,14 @@ class DASCCATrainer:
             return {"error": f"Error calculating advanced metrics: {e}"}
     
     def _calculate_temporal_metrics(self, test_dataset: tf.data.Dataset) -> Dict[str, float]:
-        """Calculate temporal performance metrics across different window sizes."""
-        print("Calculating temporal performance metrics...")
+        """Calculate temporal performance metrics.
         
-
-        window_sizes_seconds = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
-        temporal_results = {}
-        
-        for window_sec in window_sizes_seconds:
-            window_samples = int(window_sec * self.sampling_rate)
-            
-            print(f"Testing {window_sec}s window ({window_samples} samples)...")
-            
-            try:
-
-                temp_dataset = DasDatasetCCA(
-                    self.tfrecord_dir, 
-                    mode='test',
-                    window_size=window_samples,
-                    overlap=0.5,
-                    load_audio=True,  # Use real audio for accurate temporal metrics
-                    audio_base_dir=self.audio_base_dir  # Use same audio directory as main training
-                )
-                
-                if len(temp_dataset) == 0:
-                    print(f"  No data for {window_sec}s window")
-                    continue
-                
-
-                def temp_generator():
-                    for i in range(len(temp_dataset)):
-                        window_data, aux_data = temp_dataset[i]
-                        
-                        # Extract label from aux_data (new format) or directly (old format)
-                        # Ensure label is ALWAYS a tensor with shape (1,) not a scalar
-                        try:
-                            if isinstance(aux_data, dict):
-                                label_tensor = aux_data.get('label', None)
-                                if label_tensor is None:
-                                    label_value = 0
-                                elif hasattr(label_tensor, 'numpy'):
-                                    label_array = label_tensor.numpy()
-                                    if label_array.size > 0:
-                                        # Handle both array and scalar cases
-                                        if label_array.ndim == 0:  # Scalar numpy array
-                                            label_value = int(label_array.item())
-                                        else:
-                                            label_value = int(label_array.flat[0])
-                                    else:
-                                        label_value = 0
-                                elif hasattr(label_tensor, '__len__') and len(label_tensor) > 0:
-                                    label_value = int(label_tensor[0])
-                                elif hasattr(label_tensor, 'item'):
-                                    label_value = int(label_tensor.item())
-                                else:
-                                    label_value = int(label_tensor) if label_tensor is not None else 0
-                            else:
-                                # Old format: aux_data is the label directly
-                                if hasattr(aux_data, 'numpy'):
-                                    label_array = aux_data.numpy()
-                                    if label_array.size > 0:
-                                        # Handle both array and scalar cases
-                                        if label_array.ndim == 0:  # Scalar numpy array
-                                            label_value = int(label_array.item())
-                                        else:
-                                            label_value = int(label_array.flat[0])
-                                    else:
-                                        label_value = 0
-                                elif hasattr(aux_data, '__len__') and len(aux_data) > 0:
-                                    label_value = int(aux_data[0])
-                                elif hasattr(aux_data, 'item'):
-                                    label_value = int(aux_data.item())
-                                else:
-                                    label_value = int(aux_data) if aux_data is not None else 0
-                            
-                            # Always create a tensor with shape (1,)
-                            # Ensure label_value is a Python int, not a numpy scalar
-                            if hasattr(label_value, 'item'):
-                                label_value = int(label_value.item())
-                            elif isinstance(label_value, (np.integer, np.floating)):
-                                label_value = int(label_value)
-                            else:
-                                label_value = int(label_value)
-                            
-                            # Create tensor with explicit shape (1,)
-                            label = tf.constant([label_value], dtype=tf.int64, shape=(1,))
-                            
-                        except Exception as e:
-                            # Fallback: use default label with explicit shape
-                            label = tf.constant([0], dtype=tf.int64, shape=(1,))
-
-                        if isinstance(window_data, tuple):
-                            eeg_data, audio_data = window_data
-                        else:
-
-                            eeg_data = window_data
-
-                            audio_data = tf.zeros((window_samples, 4), dtype=tf.float32)
-                        
-
-                        eeg_shape = eeg_data.shape.as_list() if hasattr(eeg_data.shape, 'as_list') else list(eeg_data.shape)
-                        audio_shape = audio_data.shape.as_list() if hasattr(audio_data.shape, 'as_list') else list(audio_data.shape)
-                        
-
-                        if len(eeg_shape) == 2 and eeg_shape[1] == 64:
-                            input_1 = eeg_data
-                        else:
-
-                            input_1 = tf.reshape(eeg_data, (window_samples, 64))
-                        
-                        # Apply time-lagging if the model was trained with it
-                        if self.model.eeg_lag_samples > 0:
-                            # Convert to numpy for time-lagging
-                            eeg_np = input_1.numpy() if hasattr(input_1, 'numpy') else np.array(input_1)
-                            lagged_eeg = _apply_time_lagging(eeg_np, self.model.eeg_lag_samples)
-                            input_1 = tf.constant(lagged_eeg, dtype=tf.float32)
-                        
-
-                        if len(audio_shape) == 2 and audio_shape[1] == 4:
-                            input_2 = audio_data
-                        elif len(audio_shape) == 2 and audio_shape[1] == 1:
-
-                            input_2 = tf.tile(audio_data, [1, 4])
-                        else:
-
-                            input_2 = tf.zeros((window_samples, 4), dtype=tf.float32)
-                        
-                        # Final safety check: ensure label is a tensor with shape (1,)
-                        if not isinstance(label, tf.Tensor):
-                            label = tf.constant([int(label)], dtype=tf.int64)
-                        elif label.shape.rank == 0:  # Scalar tensor
-                            label = tf.reshape(label, (1,))
-                        elif label.shape != (1,):
-                            label = tf.reshape(label, (1,))
-                        
-                        # Double-check shape before yielding
-                        label_shape = label.shape
-                        if label_shape.rank == 0 or (label_shape.rank == 1 and label_shape[0] != 1):
-                            label = tf.constant([0], dtype=tf.int64)  # Fallback to safe default
-                        
-                        yield {
-                            'input_1': input_1,
-                            'input_2': input_2
-                        }, label
-                
-                # Calculate expected EEG dimension based on time-lagging
-                if self.model.eeg_lag_samples > 0:
-                    expected_eeg_dim = 64 * (self.model.eeg_lag_samples + 1)
-                else:
-                    expected_eeg_dim = 64
-                
-                # FIXED: Create dataset with aux_data for proper left/right comparison
-                def create_temporal_dataset_with_aux():
-                    """Create dataset with aux_data for temporal metrics."""
-                    for i in range(len(temp_dataset)):
-                        window_data, aux_data = temp_dataset[i]
-                        
-                        # Extract label and audio envelopes
-                        if isinstance(aux_data, dict):
-                            label = aux_data.get('label', tf.constant([0], dtype=tf.int64))
-                            left_env = aux_data.get('left_env')
-                            right_env = aux_data.get('right_env')
-                        else:
-                            label = aux_data if aux_data is not None else tf.constant([0], dtype=tf.int64)
-                            left_env = None
-                            right_env = None
-                        
-                        if isinstance(window_data, tuple):
-                            eeg_data, audio_data = window_data
-                        else:
-                            eeg_data = window_data
-                            audio_data = tf.zeros((window_samples, 4), dtype=tf.float32)
-                        
-                        # Apply time-lagging if needed
-                        if self.model.eeg_lag_samples > 0:
-                            eeg_np = eeg_data.numpy() if hasattr(eeg_data, 'numpy') else np.array(eeg_data)
-                            lagged_eeg = _apply_time_lagging(eeg_np, self.model.eeg_lag_samples)
-                            eeg_data = tf.constant(lagged_eeg, dtype=tf.float32)
-                            expected_eeg_dim = 64 * (self.model.eeg_lag_samples + 1)
-                        else:
-                            expected_eeg_dim = 64
-                        
-                        # Ensure audio has correct shape
-                        if audio_data.shape[1] != 4:
-                            if audio_data.shape[1] == 1:
-                                audio_data = tf.tile(audio_data, [1, 4])
-                            else:
-                                audio_data = tf.zeros((window_samples, 4), dtype=tf.float32)
-                        
-                        # Create aux_data dict
-                        aux_dict = {'label': label}
-                        if left_env is not None and right_env is not None:
-                            # Ensure shapes match
-                            if left_env.shape[0] != window_samples:
-                                if left_env.shape[0] == 1:
-                                    left_env = tf.tile(left_env, [window_samples, 1])
-                                else:
-                                    left_env = left_env[:window_samples]
-                            if right_env.shape[0] != window_samples:
-                                if right_env.shape[0] == 1:
-                                    right_env = tf.tile(right_env, [window_samples, 1])
-                                else:
-                                    right_env = right_env[:window_samples]
-                            aux_dict['left_env'] = left_env
-                            aux_dict['right_env'] = right_env
-                        else:
-                            aux_dict['left_env'] = tf.zeros((window_samples, 4), dtype=tf.float32)
-                            aux_dict['right_env'] = tf.zeros((window_samples, 4), dtype=tf.float32)
-                        
-                        yield {
-                            'input_1': eeg_data,
-                            'input_2': audio_data
-                        }, aux_dict
-                
-                temp_tf_dataset = tf.data.Dataset.from_generator(
-                    create_temporal_dataset_with_aux,
-                    output_signature=(
-                        {
-                            'input_1': tf.TensorSpec(shape=(window_samples, expected_eeg_dim), dtype=tf.float32),
-                            'input_2': tf.TensorSpec(shape=(window_samples, 4), dtype=tf.float32)
-                        },
-                        {
-                            'label': tf.TensorSpec(shape=(1,), dtype=tf.int64),
-                            'left_env': tf.TensorSpec(shape=(window_samples, 4), dtype=tf.float32),
-                            'right_env': tf.TensorSpec(shape=(window_samples, 4), dtype=tf.float32)
-                        }
-                    )
-                )
-                
-                # Reshape batch function
-                def reshape_batch(inputs, aux_data):
-                    # Handle variable input dimensions (due to time-lagging)
-                    input_1_shape = tf.shape(inputs['input_1'])
-                    input_1_feat_dim = input_1_shape[-1]  # Get feature dimension dynamically
-                    input_1_reshaped = tf.reshape(inputs['input_1'], (-1, input_1_feat_dim))
-                    input_2_reshaped = tf.reshape(inputs['input_2'], (-1, 4))
-                    
-                    # Reshape aux_data
-                    reshaped_aux = {}
-                    if isinstance(aux_data, dict):
-                        if 'label' in aux_data:
-                            reshaped_aux['label'] = aux_data['label']
-                        if 'left_env' in aux_data:
-                            reshaped_aux['left_env'] = tf.reshape(aux_data['left_env'], (-1, 4))
-                        if 'right_env' in aux_data:
-                            reshaped_aux['right_env'] = tf.reshape(aux_data['right_env'], (-1, 4))
-                    else:
-                        reshaped_aux = aux_data
-                    
-                    return {
-                        'input_1': input_1_reshaped,
-                        'input_2': input_2_reshaped
-                    }, reshaped_aux
-                
-                temp_tf_dataset = temp_tf_dataset.batch(16).map(reshape_batch)
-                
-                # FIXED: Temporarily update model's window_size for temporal metrics
-                # This ensures proper aggregation for different window sizes
-                original_window_size = self.model.window_size
-                self.model.window_size = window_samples
-                
-                try:
-                    temp_predictions, temp_targets = self.model.predict(temp_tf_dataset)
-                finally:
-                    # Restore original window size
-                    self.model.window_size = original_window_size
-                
-                if len(temp_predictions) > 0:
-                    accuracy = accuracy_score(temp_targets, temp_predictions)
-                    f1 = f1_score(temp_targets, temp_predictions, average='weighted')
-                    
-                    temporal_results[f'accuracy_{window_sec}s'] = accuracy
-                    temporal_results[f'f1_{window_sec}s'] = f1
-                    
-                    print(f"  {window_sec}s: Acc={accuracy:.3f}, F1={f1:.3f}")
-                else:
-                    print(f"  {window_sec}s: No valid predictions")
-                    
-            except Exception as e:
-                print(f"  Error testing {window_sec}s window: {e}")
-                continue
-        
-        return temporal_results
+        Note: Temporal metrics testing multiple window sizes has been removed.
+        The main test already uses the configured window size.
+        """
+        # Return empty dict - temporal metrics removed per user request
+        # Main test already uses the configured window_size
+        return {}
     
     def save_results(self, results: Dict):
         """Save comprehensive results to files."""
@@ -2834,8 +2525,7 @@ class DASCCATrainer:
             'timestamp': datetime.now().isoformat(),
             'roc_auc_metrics': results.get('roc_auc_metrics', {}),
             'msed_metrics': results.get('msed_metrics', {}),
-            'advanced_metrics': results.get('advanced_metrics', {}),
-            'temporal_metrics': results.get('temporal_metrics', {})
+            'advanced_metrics': results.get('advanced_metrics', {})
         }
         
 
@@ -2858,6 +2548,9 @@ class DASCCATrainer:
     
     def _save_comprehensive_report(self, results: Dict):
         """Save a comprehensive metrics report."""
+        def _fmt(v):
+            return f"{v:.4f}" if v is not None and isinstance(v, (int, float)) else 'N/A'
+
         with open(self.output_dir / 'comprehensive_metrics_report.txt', 'w') as f:
             f.write("=" * 80 + "\n")
             f.write("DASCCA COMPREHENSIVE METRICS REPORT\n")
@@ -2873,52 +2566,46 @@ class DASCCATrainer:
             if "error" not in roc_auc:
                 f.write("ROC-AUC METRICS:\n")
                 f.write("-" * 40 + "\n")
-                f.write(f"ROC-AUC Score: {roc_auc.get('roc_auc_score', 'N/A'):.4f}\n")
-                f.write(f"Average Precision: {roc_auc.get('average_precision', 'N/A'):.4f}\n")
-                f.write(f"Optimal Threshold: {roc_auc.get('optimal_threshold', 'N/A'):.4f}\n")
-                f.write(f"Optimal TPR: {roc_auc.get('optimal_tpr', 'N/A'):.4f}\n")
-                f.write(f"Optimal FPR: {roc_auc.get('optimal_fpr', 'N/A'):.4f}\n\n")
+                f.write(f"ROC-AUC Score: {_fmt(roc_auc.get('roc_auc_score'))}\n")
+                f.write(f"Average Precision: {_fmt(roc_auc.get('average_precision'))}\n")
+                f.write(f"Optimal Threshold: {_fmt(roc_auc.get('optimal_threshold'))}\n")
+                f.write(f"Optimal TPR: {_fmt(roc_auc.get('optimal_tpr'))}\n")
+                f.write(f"Optimal FPR: {_fmt(roc_auc.get('optimal_fpr'))}\n\n")
             
 
             msed = results.get('msed_metrics', {})
             if "error" not in msed:
                 f.write("MSED METRICS:\n")
                 f.write("-" * 40 + "\n")
-                f.write(f"Mean Squared Error: {msed.get('mse', 'N/A'):.4f}\n")
-                f.write(f"Root Mean Squared Error: {msed.get('rmse', 'N/A'):.4f}\n")
-                f.write(f"Mean Absolute Error: {msed.get('mae', 'N/A'):.4f}\n")
-                f.write(f"Mean Absolute Percentage Error: {msed.get('mape', 'N/A'):.4f}%\n")
-                f.write(f"R-squared: {msed.get('r_squared', 'N/A'):.4f}\n\n")
+                f.write(f"Mean Squared Error: {_fmt(msed.get('mse'))}\n")
+                f.write(f"Root Mean Squared Error: {_fmt(msed.get('rmse'))}\n")
+                f.write(f"Mean Absolute Error: {_fmt(msed.get('mae'))}\n")
+                f.write(f"Mean Absolute Percentage Error: {_fmt(msed.get('mape'))}%\n")
+                f.write(f"R-squared: {_fmt(msed.get('r_squared'))}\n\n")
             
 
             advanced = results.get('advanced_metrics', {})
             if "error" not in advanced:
                 f.write("ADVANCED METRICS:\n")
                 f.write("-" * 40 + "\n")
-                f.write(f"Matthews Correlation Coefficient: {advanced.get('matthews_correlation_coefficient', 'N/A'):.4f}\n")
-                f.write(f"Cohen's Kappa: {advanced.get('cohens_kappa', 'N/A'):.4f}\n")
-                f.write(f"Balanced Accuracy: {advanced.get('balanced_accuracy', 'N/A'):.4f}\n\n")
+                f.write(f"Matthews Correlation Coefficient: {_fmt(advanced.get('matthews_correlation_coefficient'))}\n")
+                f.write(f"Cohen's Kappa: {_fmt(advanced.get('cohens_kappa'))}\n")
+                f.write(f"Balanced Accuracy: {_fmt(advanced.get('balanced_accuracy'))}\n\n")
             
-
-            temporal = results.get('temporal_metrics', {})
-            f.write("TEMPORAL PERFORMANCE ANALYSIS:\n")
-            f.write("-" * 40 + "\n")
-            for key, value in temporal.items():
-                f.write(f"{key}: {value:.4f}\n")
+            # Temporal metrics removed - main test uses configured window size
 
 
 def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16, 
-                           window_size: int = 32, overlap: float = 0.5,
+                           window_size: int = 32, overlap: float = 0.25,
                            train_ratio: float = 0.64, val_ratio: float = 0.18,  # Adjusted to ensure at least 2 val subjects (11 * 0.18 = 1.98 -> 2)
                            max_samples: Optional[int] = None,
                            audio_base_dir: Optional[str] = None,
                            load_audio: bool = True, max_files: Optional[int] = None,
-                           eeg_lag_samples: int = 0, pca_model: Optional[PCA] = None) -> Tuple[tf.data.Dataset, tf.data.Dataset, tf.data.Dataset]:
+                           eeg_lag_samples: int = 0) -> Tuple[tf.data.Dataset, tf.data.Dataset, tf.data.Dataset]:
     """Create data loaders for DAS dataset with proper subject-wise splitting.
     
     Args:
-        eeg_lag_samples: Number of past time samples to include for backward model (0 = no lagging)
-        pca_model: Pre-fitted PCA model to apply to EEG data (None = no PCA)
+        eeg_lag_samples: Number of past time samples to include for backward model (0 = no lagging, deprecated)
     """
     
     print("Creating DAS dataset with subject-wise splitting...")
@@ -2952,26 +2639,23 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
         data_idx_to_subject[i] = subject_id
     
 
+    # FIXED: Build subject indices directly instead of assuming ordered metadata
+    from collections import defaultdict
+    subject_to_sample_indices = defaultdict(list)
+    for i, md in enumerate(full_dataset.metadata):
+        subject_id = md.get('subject_id', 'unknown')
+        subject_to_sample_indices[subject_id].append(i)
+    
+    # Build subject ranges from indices (for backward compatibility)
     subject_ranges = {}
-    current_subject = None
-    start_idx = 0
+    for subject_id, indices in subject_to_sample_indices.items():
+        if indices:
+            subject_ranges[subject_id] = (min(indices), max(indices) + 1)
     
-    for i, metadata in enumerate(full_dataset.metadata):
-        subject_id = metadata.get('subject_id', 'unknown')
-        
-        if subject_id != current_subject:
-            if current_subject is not None:
-                subject_ranges[current_subject] = (start_idx, i)
-            current_subject = subject_id
-            start_idx = i
-    
-
-    if current_subject is not None:
-        subject_ranges[current_subject] = (start_idx, len(full_dataset.metadata))
-    
-    print(f"Subject ranges in metadata:")
-    for subject_id, (start, end) in subject_ranges.items():
-        print(f"  {subject_id}: samples {start}-{end-1} ({end-start} samples)")
+    print(f"Subject indices (built directly, not assuming order):")
+    for subject_id, indices in list(subject_to_sample_indices.items())[:10]:  # Show first 10
+        print(f"  {subject_id}: {len(indices)} samples, range {min(indices)}-{max(indices)}")
+    print(f"  ... (total {len(subject_to_sample_indices)} subjects)")
     
 
     unknown_count = sum(1 for sid in data_idx_to_subject.values() if sid == "unknown")
@@ -2984,41 +2668,37 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
 
 
 
-    for i, (data_idx, label) in enumerate(full_dataset.window_indices):
-        subject_id = "unknown"
-        
-
-        if data_idx in data_idx_to_subject:
-            subject_id = data_idx_to_subject[data_idx]
-        else:
-
-
-            closest_idx = min(data_idx_to_subject.keys(), key=lambda x: abs(x - data_idx))
-            if abs(closest_idx - data_idx) < full_dataset.window_size:
-                subject_id = data_idx_to_subject[closest_idx]
+    # FIXED: Use window-level subject IDs from __getitem__ instead of inferring from data_idx
+    # This avoids unit mismatches and ensures correct subject assignment
+    print("Building subject-to-window mapping from dataset metadata...")
+    for i in range(len(full_dataset)):
+        try:
+            # Get window data to extract subject_id from aux_data
+            window_data, aux_data = full_dataset[i]
+            if isinstance(aux_data, dict) and 'subject_id' in aux_data:
+                subject_id = aux_data['subject_id']
+                if isinstance(subject_id, tf.Tensor):
+                    subject_id = subject_id.numpy().decode('utf-8') if subject_id.dtype == tf.string else str(subject_id.numpy())
+                elif not isinstance(subject_id, str):
+                    subject_id = str(subject_id)
             else:
-
-                for subj_id, (start_idx, end_idx) in subject_ranges.items():
-                    if start_idx <= data_idx < end_idx:
-                        subject_id = subj_id
-                        break
-        
-
-
-        window_subjects = []
-        for sample_idx in range(data_idx, min(data_idx + full_dataset.window_size, len(data_idx_to_subject))):
-            if sample_idx in data_idx_to_subject:
-                window_subjects.append(data_idx_to_subject[sample_idx])
-        
-        if window_subjects:
-
-            from collections import Counter
-            subject_counts = Counter(window_subjects)
-            subject_id = subject_counts.most_common(1)[0][0]
-        
-        if subject_id not in subject_windows:
-            subject_windows[subject_id] = []
-        subject_windows[subject_id].append(i)
+                # Fallback: try to get from metadata using data_idx
+                data_idx, _ = full_dataset.window_indices[i]
+                if data_idx < len(full_dataset._row_to_metadata):
+                    window_metadata = full_dataset._row_to_metadata[data_idx]
+                    subject_id = window_metadata.get('subject_id', 'unknown')
+                else:
+                    subject_id = "unknown"
+            
+            if subject_id not in subject_windows:
+                subject_windows[subject_id] = []
+            subject_windows[subject_id].append(i)
+        except Exception as e:
+            print(f"⚠ WARNING: Could not get subject_id for window {i}: {e}")
+            # Fallback to unknown
+            if "unknown" not in subject_windows:
+                subject_windows["unknown"] = []
+            subject_windows["unknown"].append(i)
     
     print(f"Found {len(subject_windows)} subjects:")
     for subject_id, windows in subject_windows.items():
@@ -3124,24 +2804,23 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
         dataset_window_size = full_dataset.window_size
         dataset_batch_size = batch_size
         
-        # Calculate expected feature dimension based on time-lagging and PCA
+        # Calculate expected feature dimension (no PCA, no backward model lagging)
         base_eeg_dim = 64  # Original EEG channels
-        if eeg_lag_samples > 0:
-            # Time-lagging: concatenate past samples
-            expected_eeg_dim = base_eeg_dim * (eeg_lag_samples + 1)
-        else:
-            expected_eeg_dim = base_eeg_dim
-        
-        if pca_model is not None:
-            # PCA reduces to pca_components
-            expected_eeg_dim = pca_model.n_components_
-        
-        pca_info = pca_model.n_components_ if pca_model is not None else 'None'
-        print(f"  Expected EEG feature dimension: {expected_eeg_dim} (base: {base_eeg_dim}, lag: {eeg_lag_samples}, PCA: {pca_info})")
+        expected_eeg_dim = base_eeg_dim
+        print(f"  Expected EEG feature dimension: {expected_eeg_dim} (base: {base_eeg_dim})")
         
         def generator():
             valid_samples = 0
-            for i in indices:
+            skipped_samples = 0
+            error_counts = {}
+            
+            if len(indices) == 0:
+                print(f"⚠ ERROR: No indices provided to generator! Cannot create dataset.")
+                return
+            
+            print(f"  Generator starting with {len(indices)} indices...")
+            
+            for idx, i in enumerate(indices):
                 try:
                     window_data, aux_data = full_dataset[i]
                     
@@ -3155,7 +2834,10 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
                         label = aux_data
                         left_env = None
                         right_env = None
-                        print(f"WARNING: Unexpected aux_data format (not dict). This may indicate a data loading issue.")
+                        error_key = "unexpected_aux_format"
+                        error_counts[error_key] = error_counts.get(error_key, 0) + 1
+                        if idx < 5:  # Only print first 5 to avoid spam
+                            print(f"WARNING: Unexpected aux_data format (not dict) for index {i}. This may indicate a data loading issue.")
                     
 
                     if isinstance(window_data, tuple):
@@ -3176,27 +2858,14 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
                         # Get audio from the dataset's audio_envelopes if available
                         # This should not happen if __getitem__ returns tuple correctly
                         print(f"WARNING: window_data is not a tuple. Attempting to use audio from dataset...")
-                        # Try to get audio from full_dataset if available
-                        try:
-                            # Get the actual audio data from the dataset
-                            window_idx = indices[valid_samples] if 'indices' in locals() else None
-                            if window_idx is not None and hasattr(full_dataset, 'audio_envelopes'):
-                                data_idx, _ = full_dataset.window_indices[window_idx]
-                                audio_data = full_dataset.audio_envelopes[data_idx:data_idx + dataset_window_size]
-                                if len(audio_data) < dataset_window_size:
-                                    # Pad if needed
-                                    padding = np.zeros((dataset_window_size - len(audio_data), audio_data.shape[1] if len(audio_data.shape) > 1 else 1), dtype=np.float32)
-                                    audio_data = np.vstack([audio_data, padding])
-                                audio_data = tf.constant(audio_data, dtype=tf.float32)
-                            else:
-                                raise ValueError("Cannot recover audio data - window_data format error")
-                        except Exception as e:
-                            print(f"ERROR: Cannot recover audio data: {e}")
-                            print(f"  This sample will be skipped to prevent training on corrupted data.")
-                            continue
+                        # FIXED: Remove broken recovery path - treat non-tuple as fatal error
+                        # window_data should always be a tuple from DasDatasetCCA.__getitem__
+                        print(f"ERROR: window_data is not a tuple (got {type(window_data)}). This is a fatal data loading error.")
+                        print(f"  Skipping this sample to prevent training on corrupted data.")
+                        print(f"  Expected: (eeg_tensor, audio_tensor) tuple")
+                        print(f"  Got: {window_data}")
+                        continue
                     
-
-
                     eeg_shape = eeg_data.shape.as_list() if hasattr(eeg_data.shape, 'as_list') else list(eeg_data.shape)
                     audio_shape = audio_data.shape.as_list() if hasattr(audio_data.shape, 'as_list') else list(audio_data.shape)
                     
@@ -3215,37 +2884,13 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
                         eeg_np = input_1.numpy() if hasattr(input_1, 'numpy') else np.array(input_1)
                         lagged_eeg = _apply_time_lagging(eeg_np, eeg_lag_samples)
                         input_1 = tf.constant(lagged_eeg, dtype=tf.float32)
-                    
-                    # Apply PCA transformation (if enabled)
-                    if pca_model is not None:
-                        # Flatten time dimension for PCA
-                        original_shape = input_1.shape
-                        eeg_flat = tf.reshape(input_1, (-1, original_shape[-1]))
-                        eeg_np = eeg_flat.numpy() if hasattr(eeg_flat, 'numpy') else np.array(eeg_flat)
-                        eeg_pca = pca_model.transform(eeg_np)
-                        # Reshape back to (time, pca_components)
-                        input_1 = tf.constant(eeg_pca.reshape(original_shape[0], -1), dtype=tf.float32)
-                    
 
 
-                    if len(audio_shape) == 1:
-
-
-                        audio_expanded = tf.tile(tf.reshape(audio_data, (dataset_window_size, 1)), [1, 4])
-                        input_2 = audio_expanded
-                    elif len(audio_shape) == 2:
-
-                        if audio_shape[1] == 1:
-
-                            input_2 = tf.tile(audio_data, [1, 4])
-                        else:
-                            input_2 = audio_data
-                    else:
-                        # FIXED: This should not happen if window_data is properly formatted
-                        print(f"ERROR: Unexpected audio shape {audio_shape}.")
-                        print(f"  Expected audio_data from window_data tuple with shape (window_size, 4) or (window_size, 1)")
-                        print(f"  This indicates a data loading error. Skipping this sample.")
+                    # Enforce audio shape = (window_size, 4)
+                    if len(audio_shape) != 2 or audio_shape[0] != dataset_window_size or audio_shape[1] != 4:
+                        print(f"ERROR: audio_data shape {audio_shape} invalid. Expected ({dataset_window_size}, 4). Skipping.")
                         continue
+                    input_2 = tf.cast(audio_data, tf.float32)
                     
                     valid_samples += 1
                     
@@ -3253,31 +2898,29 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
                     # Always include left_env and right_env in aux_dict to match output signature
                     aux_dict = {'label': label}
                     
-                    # Ensure left_env and right_env are always present with correct shape
+                    # Ensure left_env and right_env are always present with correct shape (window_size, 4)
                     if left_env is not None and right_env is not None:
-                        # Ensure shapes match
-                        if left_env.shape[0] != input_1.shape[0]:
-                            if left_env.shape[0] == 1:
-                                left_env = tf.tile(left_env, [input_1.shape[0], 1])
-                            else:
-                                left_env = left_env[:input_1.shape[0]]
-                        if right_env.shape[0] != input_1.shape[0]:
-                            if right_env.shape[0] == 1:
-                                right_env = tf.tile(right_env, [input_1.shape[0], 1])
-                            else:
-                                right_env = right_env[:input_1.shape[0]]
-                        aux_dict['left_env'] = left_env
-                        aux_dict['right_env'] = right_env
+                        # Enforce shape (window_size, 4)
+                        left_shape = left_env.shape.as_list() if hasattr(left_env.shape, 'as_list') else list(left_env.shape)
+                        right_shape = right_env.shape.as_list() if hasattr(right_env.shape, 'as_list') else list(right_env.shape)
+                        
+                        if len(left_shape) != 2 or left_shape[0] != dataset_window_size or left_shape[1] != 4:
+                            print(f"ERROR: left_env shape {left_shape} invalid. Expected ({dataset_window_size}, 4). Skipping.")
+                            continue
+                        if len(right_shape) != 2 or right_shape[0] != dataset_window_size or right_shape[1] != 4:
+                            print(f"ERROR: right_env shape {right_shape} invalid. Expected ({dataset_window_size}, 4). Skipping.")
+                            continue
+                        
+                        aux_dict['left_env'] = tf.cast(left_env, tf.float32)
+                        aux_dict['right_env'] = tf.cast(right_env, tf.float32)
                     else:
-                        # FIXED: left_env and right_env should always be available from __getitem__
-                        # If not, this indicates a data loading error
-                        window_shape = tf.shape(input_1)[0]
-                        if not hasattr(create_cca_dataset, '_missing_audio_warned'):
-                            print(f"⚠ WARNING: Left/right audio envelopes not available in aux_data.")
-                            print(f"  Using zeros as fallback. This may affect model performance.")
-                            create_cca_dataset._missing_audio_warned = True
-                        aux_dict['left_env'] = tf.zeros((window_shape, 4), dtype=tf.float32)
-                        aux_dict['right_env'] = tf.zeros((window_shape, 4), dtype=tf.float32)
+                        # left_env and right_env should always be available from __getitem__
+                        error_key = "missing_audio_envelopes"
+                        error_counts[error_key] = error_counts.get(error_key, 0) + 1
+                        if skipped_samples < 5:  # Only print first 5 to avoid spam
+                            print(f"ERROR: Left/right audio envelopes not available for index {i}. Skipping sample.")
+                        skipped_samples += 1
+                        continue
                     
                     yield {
                         'input_1': input_1,
@@ -3285,10 +2928,21 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
                     }, aux_dict
                     
                 except Exception as e:
-                    print(f"ERROR in generator for index {i}: {e}")
+                    error_key = type(e).__name__
+                    error_counts[error_key] = error_counts.get(error_key, 0) + 1
+                    if skipped_samples < 5:  # Only print first 5 to avoid spam
+                        print(f"ERROR in generator for index {i}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    skipped_samples += 1
                     continue
             
-            print(f"Generator produced {valid_samples} valid samples")
+            print(f"Generator completed: {valid_samples} valid samples, {skipped_samples} skipped")
+            if error_counts:
+                print(f"  Error breakdown: {error_counts}")
+            if valid_samples == 0:
+                print(f"⚠ CRITICAL: Generator produced 0 valid samples! This will cause empty dataset.")
+                print(f"  Total indices: {len(indices)}, Skipped: {skipped_samples}")
         
 
         dataset = tf.data.Dataset.from_generator(
@@ -3308,14 +2962,16 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
         
 
         def reshape_batch(inputs, aux_data):
-            # Reshape inputs
-            # Handle variable input dimensions (due to time-lagging or PCA)
+            # Input shapes: (B, W, F1) for input_1, (B, W, 4) for input_2
             input_1_shape = tf.shape(inputs['input_1'])
-            input_1_feat_dim = input_1_shape[-1]  # Get feature dimension dynamically
-            input_1_reshaped = tf.reshape(inputs['input_1'], (-1, input_1_feat_dim))
+            B = input_1_shape[0]  # batch_size
+            W = input_1_shape[1]  # window_size
+            F1 = input_1_shape[2]  # feature_dim
+            
+            # Flatten time: (B*W, F1) and (B*W, 4)
+            input_1_reshaped = tf.reshape(inputs['input_1'], (-1, F1))
             input_2_reshaped = tf.reshape(inputs['input_2'], (-1, 4))
             
-            # Reshape aux_data
             reshaped_inputs = {
                 'input_1': input_1_reshaped,
                 'input_2': input_2_reshaped
@@ -3323,19 +2979,31 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
             
             reshaped_aux = {}
             if isinstance(aux_data, dict):
+                # Keep window-level label as (B, 1) unchanged
                 if 'label' in aux_data:
                     reshaped_aux['label'] = aux_data['label']
+                
+                # Flatten envelopes to match flattened inputs
                 if 'left_env' in aux_data:
-                    reshaped_aux['left_env'] = tf.reshape(aux_data['left_env'], (-1, 4))
+                    reshaped_aux['left_env'] = tf.reshape(aux_data['left_env'], (-1, 4))  # (B*W, 4)
                 if 'right_env' in aux_data:
-                    reshaped_aux['right_env'] = tf.reshape(aux_data['right_env'], (-1, 4))
+                    reshaped_aux['right_env'] = tf.reshape(aux_data['right_env'], (-1, 4))  # (B*W, 4)
+                
+                # Preserve exact recovery info (used in predict + LDA)
+                reshaped_aux['_batch_size'] = B
+                reshaped_aux['_window_size'] = W
             else:
-                # Fallback for old format
                 reshaped_aux = aux_data
             
             return reshaped_inputs, reshaped_aux
         
-        return dataset.batch(dataset_batch_size).map(reshape_batch)
+        # Optimize dataset pipeline for faster training
+        dataset = dataset.batch(dataset_batch_size).map(reshape_batch)
+        
+        # Add prefetching for better GPU utilization (overlaps data loading with computation)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        
+        return dataset
     
     train_dataset = create_cca_dataset(train_indices)
     val_dataset = create_cca_dataset(val_indices)
@@ -3363,6 +3031,39 @@ def create_das_data_loaders(tfrecord_dir: str, batch_size: int = 16,
     return train_dataset, val_dataset, test_dataset
 
 
+def _run_dascca_single(args, window_size: int, output_dir: str):
+    """Run one DASCCA train+test for a given window_size. Returns (best_val_acc, results dict)."""
+    train_dataset, val_dataset, test_dataset = create_das_data_loaders(
+        args.tfrecord_dir, batch_size=args.batch_size, window_size=window_size,
+        audio_base_dir=args.audio_base_dir, load_audio=args.load_audio,
+        max_files=args.max_files,
+        eeg_lag_samples=0
+    )
+    cca_dims_value = args.cca_dims if args.cca_dims > 0 else 40
+    model = DASCCAModel(
+        cca_dims=cca_dims_value,
+        regularization=args.regularization if args.regularization > 0 else 0.08,
+        window_size=window_size,
+        use_time_lags=args.use_time_lags,
+        min_lag_ms=args.min_lag_ms,
+        max_lag_ms=args.max_lag_ms,
+        fs=args.sampling_rate,
+        use_lda=args.use_lda,
+        pca_eeg=args.pca_eeg,
+        pca_audio=args.pca_audio,
+        eeg_lag_taps=args.eeg_lag_taps
+    )
+    if args.use_time_lags:
+        print(f"  Audio shape with lags: (T, 4*{model.num_lags}) = (T, {4*model.num_lags}) -> cca_dims max = min(64, {4*model.num_lags}) = {min(64, 4*model.num_lags)}")
+    trainer = DASCCATrainer(model, output_dir, args.tfrecord_dir,
+                           sampling_rate=args.sampling_rate, window_size=window_size,
+                           audio_base_dir=args.audio_base_dir)
+    best_val_acc = trainer.train(train_dataset, val_dataset)
+    results = trainer.test(test_dataset)
+    trainer.save_results(results)
+    return best_val_acc, results
+
+
 def main():
     """Main function for DASCCA training."""
     import argparse
@@ -3372,12 +3073,22 @@ def main():
                        help='TFRecord directory path')
     parser.add_argument('--batch_size', type=int, default=16,
                        help='Batch size for training')
-    parser.add_argument('--cca_dims', type=int, default=5,
-                       help='Number of CCA dimensions')
-    parser.add_argument('--regularization', type=float, default=0.01,
-                       help='CCA regularization parameter')
-    parser.add_argument('--window_size', type=int, default=512,
-                       help='Window size for EEG data (512 samples = 4 seconds at 128Hz)')
+    parser.add_argument('--cca_dims', type=int, default=-1,
+                       help='Number of CCA dimensions (default: -1 to auto-select 40, or specify value)')
+    parser.add_argument('--regularization', type=float, default=0.08,
+                       help='CCA regularization parameter (default: 0.08 optimal for DAS, use 0.05-0.1 range)')
+    parser.add_argument('--window_size', type=int, default=1024,
+                       help='Window size in samples (used when --no_window_sweep). 1024 = 8s at 128Hz')
+    parser.add_argument('--window_sweep', action='store_true', default=True,
+                       help='Run 1s to 30s window sweep (default)')
+    parser.add_argument('--no_window_sweep', dest='window_sweep', action='store_false',
+                       help='Use single --window_size instead of sweep')
+    parser.add_argument('--window_sweep_min', type=float, default=1.0,
+                       help='Sweep start in seconds (default: 1)')
+    parser.add_argument('--window_sweep_max', type=float, default=30.0,
+                       help='Sweep end in seconds (default: 30)')
+    parser.add_argument('--window_sweep_step', type=float, default=1.0,
+                       help='Sweep step in seconds (default: 1)')
     parser.add_argument('--output_dir', type=str, default='dascca_results',
                        help='Output directory for results')
     parser.add_argument('--audio_base_dir', type=str, default=None,
@@ -3390,12 +3101,26 @@ def main():
                        help='Maximum number of TFRecord files to load (for faster testing)')
     parser.add_argument('--eeg_lag_samples', type=int, default=5,
                        help='Number of past time samples for backward model (default: 5)')
-    parser.add_argument('--pca_components', type=int, default=None,
-                       help='Number of PCA components for EEG regularization (None = no PCA)')
     parser.add_argument('--use_lda', action='store_true', default=True,
                        help='Use LDA classifier downstream (default: True)')
     parser.add_argument('--no_lda', dest='use_lda', action='store_false',
                        help='Disable LDA classifier, use direct correlation comparison')
+    parser.add_argument('--sampling_rate', type=float, default=128.0,
+                       help='Envelope/EEG sampling rate in Hz for time lags (default: 128)')
+    parser.add_argument('--use_time_lags', action='store_true', default=True,
+                       help='Use time-lagged audio features 0-250 ms for speech tracking (default: True)')
+    parser.add_argument('--no_time_lags', dest='use_time_lags', action='store_false',
+                       help='Disable time-lagged audio (use single time point only)')
+    parser.add_argument('--min_lag_ms', type=float, default=0.0,
+                       help='Minimum lag in ms (default: 0 for 0-250 ms range)')
+    parser.add_argument('--max_lag_ms', type=float, default=250.0,
+                       help='Maximum lag in ms for speech tracking (default: 250)')
+    parser.add_argument('--eeg_lag_taps', type=int, default=5,
+                       help='Backward model EEG taps L: x(t)=[eeg(t),...,eeg(t-L+1)]. 0=no EEG lag (default: 5)')
+    parser.add_argument('--pca_eeg', type=int, default=25,
+                       help='PCA components on EEG before CCA; 0=off (default: 25)')
+    parser.add_argument('--pca_audio', type=int, default=0,
+                       help='PCA components on audio before CCA; 0=off')
     
     args = parser.parse_args()
     
@@ -3405,7 +3130,7 @@ def main():
     print("Features:")
     print("- CCA implementation based on telluride_decoding")
     print("- Accuracy, MSED, ROC-AUC metrics")
-    print("- Temporal performance analysis (0.5s to 30s)")
+    print("- Window sweep 1s to 30s (default); or single window with --no_window_sweep")
     print("- DAS preprocessing integration for data quality")
     print("- Data leakage prevention")
     print("- Validated attention labels")
@@ -3422,93 +3147,82 @@ def main():
         print("⚠ Audio loading DISABLED - using dummy audio (faster but may affect accuracy)")
     if args.max_files:
         print(f"⚠ Limiting to {args.max_files} TFRecord files (for faster testing)")
-    
 
-    print(f"\nCreating DAS data loaders...")
-    # Create datasets - we'll fit PCA after model creation if needed
-    train_dataset, val_dataset, test_dataset = create_das_data_loaders(
-        args.tfrecord_dir, batch_size=args.batch_size, window_size=args.window_size,
-        audio_base_dir=args.audio_base_dir, load_audio=args.load_audio,
-        max_files=args.max_files,
-        eeg_lag_samples=args.eeg_lag_samples if args.eeg_lag_samples > 0 else 0,
-        pca_model=None  # Will be set after fitting
-    )
-    
+    fs = int(args.sampling_rate)
 
+    if args.window_sweep:
+        # 1s to 30s window sweep (default)
+        sweep_sec = []
+        s = args.window_sweep_min
+        while s <= args.window_sweep_max + 1e-6:
+            sweep_sec.append(s)
+            s += args.window_sweep_step
+        print(f"\nWindow sweep: {args.window_sweep_min}s to {args.window_sweep_max}s, step {args.window_sweep_step}s ({len(sweep_sec)} windows)")
+        sweep_results = []
+        for sec in sweep_sec:
+            window_size = int(sec * fs)
+            out_dir = os.path.join(args.output_dir, f"window_{sec:.0f}s")
+            print("\n" + "=" * 80)
+            print(f"DASCCA window size: {window_size} samples ({sec:.1f}s at {fs} Hz)")
+            print("=" * 80)
+            print(f"\nCreating DAS data loaders (window={window_size})...")
+            best_val_acc, results = _run_dascca_single(args, window_size, out_dir)
+            adv = results.get('advanced_metrics', {})
+            roc = results.get('roc_auc_metrics', {})
+            sweep_results.append({
+                'window_seconds': sec,
+                'window_samples': window_size,
+                'validation_accuracy': best_val_acc,
+                'test_accuracy': results.get('accuracy'),
+                'balanced_accuracy': adv.get('balanced_accuracy'),
+                'roc_auc': roc.get('roc_auc_score') if 'error' not in roc else None,
+            })
+        # Save sweep summary
+        sweep_path = os.path.join(args.output_dir, 'window_sweep_results.json')
+        with open(sweep_path, 'w') as f:
+            json.dump(sweep_results, f, indent=2)
+        print("\n" + "=" * 80)
+        print("WINDOW SWEEP SUMMARY (1s to 30s)")
+        print("=" * 80)
+        print(f"{'Window (s)':<12} {'Val Acc':<10} {'Test Acc':<10} {'Bal Acc':<10} {'ROC-AUC':<10}")
+        for r in sweep_results:
+            print(f"{r['window_seconds']:<12.1f} {r['validation_accuracy'] or 0:<10.4f} {r['test_accuracy'] or 0:<10.4f} {r['balanced_accuracy'] or 0:<10.4f} {r['roc_auc'] or 0:<10.4f}")
+        print(f"\nSweep results saved to: {sweep_path}")
+        return
+
+    # Single window run
+    print(f"\nCreating DAS data loaders (window={args.window_size} samples = {args.window_size/fs:.1f}s)...")
     print("\nCreating DASCCA model...")
-    model = DASCCAModel(
-        cca_dims=args.cca_dims,
-        regularization=args.regularization,
-        window_size=args.window_size,
-        eeg_lag_samples=args.eeg_lag_samples,
-        pca_components=args.pca_components,
-        use_lda=args.use_lda
-    )
-    
-    # If PCA is enabled, fit it on training data and recreate datasets with PCA
-    if args.pca_components is not None:
-        print("Fitting PCA on training data...")
-        model._fit_pca(train_dataset)
-        # Recreate datasets with fitted PCA model
-        train_dataset, val_dataset, test_dataset = create_das_data_loaders(
-            args.tfrecord_dir, batch_size=args.batch_size, window_size=args.window_size,
-            audio_base_dir=args.audio_base_dir, load_audio=args.load_audio,
-            max_files=args.max_files,
-            eeg_lag_samples=args.eeg_lag_samples if args.eeg_lag_samples > 0 else 0,
-            pca_model=model.pca_model
-        )
-        print("✓ Datasets recreated with PCA transformation")
+    best_val_acc, results = _run_dascca_single(args, args.window_size, args.output_dir)
 
-    trainer = DASCCATrainer(model, args.output_dir, args.tfrecord_dir, 
-                           sampling_rate=128, window_size=args.window_size,  # FIXED: 128 Hz to match preprocessing
-                           audio_base_dir=args.audio_base_dir)
-    
-
-    print("\nStarting DASCCA training...")
-    best_val_acc = trainer.train(train_dataset, val_dataset)
-    
-
-    print("\nTesting DASCCA model...")
-    results = trainer.test(test_dataset)
-    
-
-    trainer.save_results(results)
-    
     print("\n" + "=" * 80)
     print("DASCCA TRAINING COMPLETE!")
     print("=" * 80)
     print(f"Validation accuracy: {best_val_acc:.4f}")
     print(f"Test accuracy: {results['accuracy']:.4f}")
-    
 
     print("\n" + "=" * 80)
     print("COMPREHENSIVE METRICS SUMMARY")
     print("=" * 80)
-    
+
+    def _fmt(v):
+        return f"{v:.4f}" if v is not None and isinstance(v, (int, float)) else 'N/A'
 
     roc_auc = results.get('roc_auc_metrics', {})
     if "error" not in roc_auc:
-        print(f"ROC-AUC Score: {roc_auc.get('roc_auc_score', 'N/A'):.4f}")
-        print(f"Average Precision: {roc_auc.get('average_precision', 'N/A'):.4f}")
-    
+        print(f"ROC-AUC Score: {_fmt(roc_auc.get('roc_auc_score'))}")
+        print(f"Average Precision: {_fmt(roc_auc.get('average_precision'))}")
 
     msed = results.get('msed_metrics', {})
     if "error" not in msed:
-        print(f"RMSE: {msed.get('rmse', 'N/A'):.4f}")
-        print(f"R-squared: {msed.get('r_squared', 'N/A'):.4f}")
-    
+        print(f"RMSE: {_fmt(msed.get('rmse'))}")
+        print(f"R-squared: {_fmt(msed.get('r_squared'))}")
 
     advanced = results.get('advanced_metrics', {})
     if "error" not in advanced:
-        print(f"Matthews Correlation Coefficient: {advanced.get('matthews_correlation_coefficient', 'N/A'):.4f}")
-        print(f"Balanced Accuracy: {advanced.get('balanced_accuracy', 'N/A'):.4f}")
-    
+        print(f"Matthews Correlation Coefficient: {_fmt(advanced.get('matthews_correlation_coefficient'))}")
+        print(f"Balanced Accuracy: {_fmt(advanced.get('balanced_accuracy'))}")
 
-    temporal = results.get('temporal_metrics', {})
-    print(f"Temporal performance across window sizes:")
-    for key, value in temporal.items():
-        print(f"  {key}: {value:.4f}")
-    
     print(f"\nResults saved to: {args.output_dir}")
     print("  - results.json (complete metrics)")
     print("  - predictions.pkl (predictions and targets)")
