@@ -20,21 +20,24 @@ import gc
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# Add telluride_decoding to path
+# Add telluride_decoding to path so we can import the CCA implementation
 sys.path.append('/home/py9363/telluride_decoding')
 from telluride_decoding.cca import BrainModelCCA, cca_pearson_correlation_first
 
+# Reduce TensorFlow noise and configure GPU memory growth
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 os.environ['TF_DETERMINISTIC_OPS'] = '1'
 os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# Configure GPU memory to avoid OOM errors
 try:
     gpu_devices = tf.config.list_physical_devices('GPU')
     if gpu_devices:
         for gpu in gpu_devices:
             tf.config.experimental.set_memory_growth(gpu, True)
         try:
+            # Limit to 8GB per GPU
             for gpu in gpu_devices:
                 tf.config.experimental.set_memory_limit(gpu, 8192)
         except (AttributeError, Exception):
@@ -49,19 +52,20 @@ device = tf.device('/GPU:0')
 tf.random.set_seed(42)
 np.random.seed(42)
 
-# Optimal Configuration (opt_3)
+# These hyperparameters were found to give 70% accuracy
 OPTIMAL_CONFIG = {
     'name': 'opt_3',
     'cca_dims': 12,
     'regularization': 0.08,
-    'window_size': 1280,  # 20.0 seconds
+    'window_size': 1280,  # 20 seconds at 64 Hz
     'batch_size': 6
 }
 
 def run_optimal_fulcca_analysis(tfrecord_dir: str = "/home/py9363/telluride_decoding/fulsang_preprocessed/tfrecords", 
                                output_dir: str = "optimal_fulcca_results"):
     """
-    Run optimal FULCCA analysis with detailed metrics and temporal performance.
+    Main function that runs the full analysis pipeline.
+    Trains the model, tests it, calculates metrics, and generates reports.
     """
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
@@ -88,10 +92,12 @@ def run_optimal_fulcca_analysis(tfrecord_dir: str = "/home/py9363/telluride_deco
 
 def create_optimal_data_loaders(tfrecord_dir: str, batch_size: int = 6, 
                               window_size: int = 1280) -> Tuple[tf.data.Dataset, tf.data.Dataset, tf.data.Dataset]:
-    """Create data loaders for optimal configuration."""
+    """Creates train/val/test datasets using the optimal split ratios."""
     from FULCCA import create_fulsang_data_loaders
     
+    # Using a fixed path since the tfrecord_dir parameter might not match
     correct_tfrecord_dir = "/home/py9363/telluride_decoding/fulsang_preprocessed/tfrecords"
+    # 60/25/15 split gives us more validation data than the default
     train_dataset, val_dataset, test_dataset = create_fulsang_data_loaders(
         correct_tfrecord_dir, 
         batch_size=batch_size, 
@@ -104,7 +110,8 @@ def create_optimal_data_loaders(tfrecord_dir: str, batch_size: int = 6,
 
 class OptimalFULCCAModel:
     """
-    Optimal FULCCA model with opt_3 configuration.
+    Wrapper around the telluride CCA model with the optimal hyperparameters.
+    Handles class balancing and prediction aggregation.
     """
     
     def __init__(self, cca_dims: int = 12, regularization: float = 0.08, window_size: int = 1280):
@@ -115,7 +122,8 @@ class OptimalFULCCAModel:
         self.is_fitted = False
     
     def fit(self, dataset: tf.data.Dataset):
-        """Fit the optimal CCA model with class balancing."""
+        """Trains the CCA model on the dataset, using class weights to handle imbalance."""
+        # Calculate weights to handle class imbalance (class 1 is minority)
         try:
             class_weights = self._calculate_class_weights(dataset)
         except Exception:
@@ -127,11 +135,13 @@ class OptimalFULCCAModel:
             loss=self._create_weighted_loss(class_weights),
             metrics=[cca_pearson_correlation_first]
         )
+        # 2 epochs seems to be the sweet spot for this model
         self.model.fit(dataset, epochs=2)
         self.is_fitted = True
     
     def _create_optimal_cca_model(self, dataset: tf.data.Dataset):
-        """Create optimal CCA model using telluride_decoding implementation."""
+        """Creates the BrainModelCCA instance with our optimal hyperparameters."""
+        # Create on CPU to avoid CUDA handle issues, then move to GPU for training
         with tf.device('/CPU:0'):
             cca_model = BrainModelCCA(
                 input_dataset=dataset,
@@ -141,7 +151,8 @@ class OptimalFULCCAModel:
         return cca_model
     
     def _calculate_class_weights(self, dataset: tf.data.Dataset) -> Dict[int, float]:
-        """Calculate class weights for imbalanced data."""
+        """Figures out how to weight each class based on their frequency in the data."""
+        # Collect all labels from the dataset
         all_labels = []
         for batch in dataset:
             if isinstance(batch, dict) and 'label' in batch:
@@ -154,6 +165,7 @@ class OptimalFULCCAModel:
         if not all_labels:
             return {0: 1.0, 1: 1.0}
         
+        # Standard sklearn-style class weight calculation
         unique_classes, class_counts = np.unique(all_labels, return_counts=True)
         total_samples = len(all_labels)
         n_classes = len(unique_classes)
@@ -161,11 +173,13 @@ class OptimalFULCCAModel:
         class_weights = {}
         for i, class_id in enumerate(unique_classes):
             if class_counts[i] > 0:
+                # Weight inversely proportional to class frequency
                 weight = total_samples / (n_classes * class_counts[i])
                 class_weights[int(class_id)] = float(weight)
             else:
                 class_weights[int(class_id)] = 1.0
         
+        # Make sure both classes have weights even if one wasn't in the sample
         if 0 not in class_weights:
             class_weights[0] = 1.0
         if 1 not in class_weights:
@@ -174,13 +188,17 @@ class OptimalFULCCAModel:
         return class_weights
     
     def _create_weighted_loss(self, class_weights: Dict[int, float]):
-        """Create weighted loss function for class balancing."""
+        """Builds a loss function that applies the class weights during training."""
         def weighted_binary_crossentropy_loss(y_true, y_pred):
+            # CCA model outputs [pred1, pred2] concatenated, we only need pred1
             cca_width = y_pred.shape[-1] // 2
             pred1 = y_pred[:, :cca_width]
+            # Use the first CCA component as our score
             cca_scores = pred1[:, 0]
+            # Convert CCA scores to probabilities using tanh
             y_pred_prob = (tf.nn.tanh(cca_scores) + 1.0) / 2.0
             
+            # Apply class weights based on true label
             weights = tf.where(y_true == 0, 
                              tf.constant(class_weights[0], dtype=tf.float32),
                              tf.constant(class_weights[1], dtype=tf.float32))
@@ -192,7 +210,7 @@ class OptimalFULCCAModel:
         return weighted_binary_crossentropy_loss
     
     def predict(self, dataset: tf.data.Dataset) -> Tuple[np.ndarray, np.ndarray]:
-        """Optimal prediction."""
+        """Makes predictions on the dataset, aggregating across time windows."""
         if not self.is_fitted:
             raise ValueError("Model must be fitted before making predictions")
         
@@ -208,23 +226,29 @@ class OptimalFULCCAModel:
                     inputs, targets = batch
                 
                 predictions = self.model(inputs)
+                # Extract first CCA component from predictions
                 cca_width = predictions.shape[-1] // 2
                 pred1 = predictions[:, :cca_width]
                 cca_scores = pred1[:, 0]
+                # Threshold at 0 to get binary predictions
                 binary_predictions = tf.cast(cca_scores > 0, tf.int64)
                 
+                # Figure out how many samples are in this batch
                 if isinstance(inputs, dict) and 'input_1' in inputs:
                     batch_size = inputs['input_1'].shape[0] // self.window_size
                 else:
                     batch_size = binary_predictions.shape[0]
                 
+                # Aggregate predictions across time windows using majority voting
                 if batch_size > 0 and binary_predictions.shape[0] % batch_size == 0:
                     pred_reshaped = tf.reshape(binary_predictions, (batch_size, -1))
                     window_size = pred_reshaped.shape[1]
+                    # Require 70% of time points to be class 1 (helps with class imbalance)
                     threshold = tf.cast(window_size * 0.70, tf.int64)
                     prediction_counts = tf.reduce_sum(pred_reshaped, axis=1)
                     sample_predictions = tf.cast(prediction_counts > threshold, tf.int64)
                 else:
+                    # Fallback if we can't reshape properly
                     sample_predictions = binary_predictions
                 
                 all_predictions.extend(sample_predictions.numpy())
@@ -235,7 +259,7 @@ class OptimalFULCCAModel:
         return np.array(all_predictions), np.array(all_targets)
 
 class OptimalFULCCATrainer:
-    """Optimal trainer with comprehensive analysis."""
+    """Handles training and testing of the model, plus metric calculation."""
     
     def __init__(self, model: OptimalFULCCAModel, output_dir: str):
         self.model = model
@@ -243,14 +267,14 @@ class OptimalFULCCATrainer:
         self.output_dir.mkdir(exist_ok=True)
     
     def train(self, train_dataset: tf.data.Dataset, val_dataset: tf.data.Dataset) -> float:
-        """Train the optimal model."""
+        """Trains the model and returns validation accuracy."""
         self.model.fit(train_dataset)
         val_predictions, val_targets = self.model.predict(val_dataset)
         val_accuracy = accuracy_score(val_targets, val_predictions)
         return val_accuracy
     
     def test(self, test_dataset: tf.data.Dataset) -> Dict:
-        """Test with comprehensive metrics."""
+        """Runs the model on test data and calculates all the metrics."""
         predictions, targets = self.model.predict(test_dataset)
         accuracy = accuracy_score(targets, predictions)
         
@@ -278,7 +302,7 @@ class OptimalFULCCATrainer:
         return results
 
 def calculate_detailed_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict:
-    """Calculate comprehensive detailed metrics."""
+    """Computes all the classification metrics we care about (precision, recall, F1, etc.)."""
     accuracy = accuracy_score(targets, predictions)
     precision = precision_score(targets, predictions, average='binary')
     recall = recall_score(targets, predictions, average='binary')
@@ -339,14 +363,16 @@ def calculate_detailed_metrics(predictions: np.ndarray, targets: np.ndarray) -> 
     return detailed_metrics
 
 def calculate_temporal_performance(tfrecord_dir: str, base_model: OptimalFULCCAModel) -> Dict:
-    """Calculate temporal performance across different window sizes."""
+    """Tests how well the model works with different time window sizes."""
     from FULCCA import create_fulsang_data_loaders
     
+    # Test different window sizes: 4s, 8s, 16s, 20s, 24s, 32s
     window_sizes = [256, 512, 1024, 1280, 1536, 2048]
     temporal_results = {}
     
     for window_size in window_sizes:
         try:
+            # Create fresh datasets for this window size
             train_dataset, val_dataset, test_dataset = create_fulsang_data_loaders(
                 "/home/py9363/telluride_decoding/fulsang_preprocessed/tfrecords",
                 batch_size=6, window_size=window_size,
@@ -354,6 +380,7 @@ def calculate_temporal_performance(tfrecord_dir: str, base_model: OptimalFULCCAM
                 val_ratio=0.25
             )
             
+            # Train a new model for this specific window size
             temp_model = OptimalFULCCAModel(
                 cca_dims=OPTIMAL_CONFIG['cca_dims'],
                 regularization=OPTIMAL_CONFIG['regularization'],
@@ -368,15 +395,17 @@ def calculate_temporal_performance(tfrecord_dir: str, base_model: OptimalFULCCAM
             temporal_results[f"{window_size/64:.1f}s_window"] = temp_accuracy
             temporal_results[f"{window_size/64:.1f}s_window_val"] = val_accuracy
             
+            # Clean up before next iteration to avoid memory issues
             cleanup_gpu_memory()
         except Exception:
+            # If a window size fails, just mark it as 0
             temporal_results[f"{window_size/64:.1f}s_window"] = 0.0
     
     return temporal_results
 
 def generate_comprehensive_report(results: Dict, detailed_metrics: Dict, temporal_metrics: Dict, 
                                 val_accuracy: float, output_path: Path):
-    """Generate comprehensive analysis report."""
+    """Prints a summary and saves all results to files."""
     print(f"Configuration: {OPTIMAL_CONFIG['name']}")
     print(f"Test Accuracy: {results['accuracy']:.4f}")
     print(f"Validation Accuracy: {val_accuracy:.4f}")
@@ -385,7 +414,8 @@ def generate_comprehensive_report(results: Dict, detailed_metrics: Dict, tempora
 
 def save_comprehensive_results(results: Dict, detailed_metrics: Dict, temporal_metrics: Dict, 
                              val_accuracy: float, output_path: Path):
-    """Save comprehensive results to files."""
+    """Writes all the results to JSON files and a text report."""
+    # Summary of key metrics
     results_to_save = {
         'configuration': OPTIMAL_CONFIG,
         'validation_accuracy': val_accuracy,
@@ -395,6 +425,7 @@ def save_comprehensive_results(results: Dict, detailed_metrics: Dict, temporal_m
         'balanced_accuracy': detailed_metrics['advanced_metrics']['balanced_accuracy']
     }
     
+    # Save everything to JSON files for later analysis
     with open(output_path / "comprehensive_results.json", 'w') as f:
         json.dump(results_to_save, f, indent=2)
     
@@ -404,6 +435,7 @@ def save_comprehensive_results(results: Dict, detailed_metrics: Dict, temporal_m
     with open(output_path / "temporal_performance.json", 'w') as f:
         json.dump(temporal_metrics, f, indent=2)
     
+    # Also save a human-readable text report
     with open(output_path / "classification_report.txt", 'w') as f:
         f.write("FULCCA Optimal Configuration Classification Report\n")
         f.write("=" * 50 + "\n\n")
@@ -423,7 +455,7 @@ def save_comprehensive_results(results: Dict, detailed_metrics: Dict, temporal_m
         f.write(f"  F1-Score: {class_report['1']['f1-score']:.4f}\n")
 
 def cleanup_gpu_memory():
-    """Clean up GPU memory."""
+    """Frees up GPU memory so we don't run out during long runs."""
     try:
         tf.keras.backend.clear_session()
         gc.collect()
